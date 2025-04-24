@@ -108,6 +108,7 @@ class Adafactor(torch.optim.Optimizer):
         warmup_init=False,
         do_paramiter_swapping=False,
         paramiter_swapping_factor=0.1,
+        stochastic_accumulation=True,
     ):
         if lr is not None and relative_step:
             raise ValueError(
@@ -136,13 +137,14 @@ class Adafactor(torch.optim.Optimizer):
         self.is_stochastic_rounding_accumulation = False
 
         # setup stochastic grad accum hooks
-        for group in self.param_groups:
-            for param in group['params']:
-                if param.requires_grad and param.dtype != torch.float32:
-                    self.is_stochastic_rounding_accumulation = True
-                    param.register_post_accumulate_grad_hook(
-                        stochastic_grad_accummulation
-                    )
+        if stochastic_accumulation:
+            for group in self.param_groups:
+                for param in group['params']:
+                    if param.requires_grad and param.dtype != torch.float32:
+                        self.is_stochastic_rounding_accumulation = True
+                        param.register_post_accumulate_grad_hook(
+                            stochastic_grad_accummulation
+                        )
     
         self.do_paramiter_swapping = do_paramiter_swapping
         self.paramiter_swapping_factor = paramiter_swapping_factor
@@ -264,6 +266,10 @@ class Adafactor(torch.optim.Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError(
                         "Adafactor does not support sparse gradients.")
+                
+                # if p has atts _scale then it is quantized. We need to divide the grad by the scale
+                # if hasattr(p, "_scale"):
+                #     grad = grad / p._scale
 
                 state = self.state[p]
                 grad_shape = grad.shape

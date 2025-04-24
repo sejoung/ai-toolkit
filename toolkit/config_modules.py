@@ -13,7 +13,7 @@ SaveFormat = Literal['safetensors', 'diffusers']
 
 if TYPE_CHECKING:
     from toolkit.guidance import GuidanceType
-    from toolkit.logging import EmptyLogger
+    from toolkit.logging_aitk import EmptyLogger
 else:
     EmptyLogger = None
 
@@ -57,6 +57,11 @@ class SampleConfig:
         self.refiner_start_at = kwargs.get('refiner_start_at',
                                            0.5)  # step to start using refiner on sample if it exists
         self.extra_values = kwargs.get('extra_values', [])
+        self.num_frames = kwargs.get('num_frames', 1)
+        self.fps: int = kwargs.get('fps', 16)
+        if self.num_frames > 1 and self.ext not in ['webp']:
+            print("Changing sample extention to animated webp")
+            self.ext = 'webp'
 
 
 class LormModuleSettingsConfig:
@@ -101,7 +106,7 @@ class LoRMConfig:
         })
 
 
-NetworkType = Literal['lora', 'locon', 'lorm']
+NetworkType = Literal['lora', 'locon', 'lorm', 'lokr']
 
 
 class NetworkConfig:
@@ -135,23 +140,38 @@ class NetworkConfig:
                 self.conv = 4
 
         self.transformer_only = kwargs.get('transformer_only', True)
+        
+        self.lokr_full_rank = kwargs.get('lokr_full_rank', False)
+        if self.lokr_full_rank and self.type.lower() == 'lokr':
+            self.linear = 9999999999
+            self.linear_alpha = 9999999999
+            self.conv = 9999999999
+            self.conv_alpha = 9999999999
+        # -1 automatically finds the largest factor
+        self.lokr_factor = kwargs.get('lokr_factor', -1)
 
 
-AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net']
+AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
 
 CLIPLayer = Literal['penultimate_hidden_states', 'image_embeds', 'last_hidden_state']
 
 
 class AdapterConfig:
     def __init__(self, **kwargs):
-        self.type: AdapterTypes = kwargs.get('type', 't2i')  # t2i, ip, clip, control_net
+        self.type: AdapterTypes = kwargs.get('type', 't2i')  # t2i, ip, clip, control_net, i2v
         self.in_channels: int = kwargs.get('in_channels', 3)
         self.channels: List[int] = kwargs.get('channels', [320, 640, 1280, 1280])
         self.num_res_blocks: int = kwargs.get('num_res_blocks', 2)
         self.downscale_factor: int = kwargs.get('downscale_factor', 8)
         self.adapter_type: str = kwargs.get('adapter_type', 'full_adapter')
         self.image_dir: str = kwargs.get('image_dir', None)
-        self.test_img_path: str = kwargs.get('test_img_path', None)
+        self.test_img_path: List[str] = kwargs.get('test_img_path', None)
+        if self.test_img_path is not None:
+            if isinstance(self.test_img_path, str):
+                self.test_img_path = self.test_img_path.split(',')
+                self.test_img_path = [p.strip() for p in self.test_img_path]
+                self.test_img_path = [p for p in self.test_img_path if p != '']
+                
         self.train: str = kwargs.get('train', False)
         self.image_encoder_path: str = kwargs.get('image_encoder_path', None)
         self.name_or_path = kwargs.get('name_or_path', None)
@@ -216,6 +236,29 @@ class AdapterConfig:
         self.conv_pooling: bool = kwargs.get('conv_pooling', False)
         self.conv_pooling_stacks: int = kwargs.get('conv_pooling_stacks', 1)
         self.sparse_autoencoder_dim: Optional[int] = kwargs.get('sparse_autoencoder_dim', None)
+        
+        # for llm adapter
+        self.num_cloned_blocks: int = kwargs.get('num_cloned_blocks', 0)
+        self.quantize_llm: bool = kwargs.get('quantize_llm', False)
+        
+        # for control lora only
+        lora_config: dict = kwargs.get('lora_config', None)
+        if lora_config is not None:
+            self.lora_config: NetworkConfig = NetworkConfig(**lora_config)
+        else:
+            self.lora_config = None
+        self.num_control_images: int = kwargs.get('num_control_images', 1)
+        # decimal for how often the control is dropped out and replaced with noise 1.0 is 100%
+        self.control_image_dropout: float = kwargs.get('control_image_dropout', 0.0)
+        self.has_inpainting_input: bool = kwargs.get('has_inpainting_input', False)
+        self.invert_inpaint_mask_chance: float = kwargs.get('invert_inpaint_mask_chance', 0.0)
+        
+        # for subpixel adapter
+        self.subpixel_downscale_factor: int = kwargs.get('subpixel_downscale_factor', 8)
+        
+        # for i2v adapter
+        # append the masked start frame. During pretraining we will only do the vision encoder
+        self.i2v_do_start_frame: bool = kwargs.get('i2v_do_start_frame', False)
 
 
 class EmbeddingConfig:
@@ -225,6 +268,11 @@ class EmbeddingConfig:
         self.init_words = kwargs.get('init_words', '*')
         self.save_format = kwargs.get('save_format', 'safetensors')
         self.trigger_class_name = kwargs.get('trigger_class_name', None)  # used for inverted masked prior
+
+
+class DecoratorConfig:
+    def __init__(self, **kwargs):
+        self.num_tokens: str = kwargs.get('num_tokens', 4)
 
 
 ContentOrStyleType = Literal['balanced', 'style', 'content']
@@ -332,6 +380,12 @@ class TrainConfig:
         # unmasked reign. It is unmasked regularization basically
         self.inverted_mask_prior = kwargs.get('inverted_mask_prior', False)
         self.inverted_mask_prior_multiplier = kwargs.get('inverted_mask_prior_multiplier', 0.5)
+        
+        # DOP will will run the same image and prompt through the network without the trigger word blank and use it as a target
+        self.diff_output_preservation = kwargs.get('diff_output_preservation', False)
+        self.diff_output_preservation_multiplier = kwargs.get('diff_output_preservation_multiplier', 1.0)
+        # If the trigger word is in the prompt, we will use this class name to replace it eg. "sks woman" -> "woman"
+        self.diff_output_preservation_class = kwargs.get('diff_output_preservation_class', '')
 
         # legacy
         if match_adapter_assist and self.match_adapter_chance == 0.0:
@@ -341,8 +395,8 @@ class TrainConfig:
         self.standardize_images = kwargs.get('standardize_images', False)
         self.standardize_latents = kwargs.get('standardize_latents', False)
 
-        if self.train_turbo and not self.noise_scheduler.startswith("euler"):
-            raise ValueError(f"train_turbo is only supported with euler and wuler_a noise schedulers")
+        # if self.train_turbo and not self.noise_scheduler.startswith("euler"):
+        #     raise ValueError(f"train_turbo is only supported with euler and wuler_a noise schedulers")
 
         self.dynamic_noise_offset = kwargs.get('dynamic_noise_offset', False)
         self.do_cfg = kwargs.get('do_cfg', False)
@@ -358,7 +412,7 @@ class TrainConfig:
         self.correct_pred_norm = kwargs.get('correct_pred_norm', False)
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
-        self.loss_type = kwargs.get('loss_type', 'mse')
+        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace
 
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
@@ -370,7 +424,8 @@ class TrainConfig:
         self.do_prior_divergence = kwargs.get('do_prior_divergence', False)
 
         ema_config: Union[Dict, None] = kwargs.get('ema_config', None)
-        if ema_config is not None:
+        # if it is set explicitly to false, leave it false. 
+        if ema_config is not None and ema_config.get('use_ema', None) is not None:
             ema_config['use_ema'] = True
             print(f"Using EMA")
         else:
@@ -381,7 +436,7 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
-        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend
         self.linear_timesteps = kwargs.get('linear_timesteps', False)
         self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
         self.disable_sampling = kwargs.get('disable_sampling', False)
@@ -393,6 +448,21 @@ class TrainConfig:
         self.do_paramiter_swapping = kwargs.get('do_paramiter_swapping', False)
         # 0.1 is 10% of the parameters active at a time lower is less vram, higher is more
         self.paramiter_swapping_factor = kwargs.get('paramiter_swapping_factor', 0.1)
+        # bypass the guidance embedding for training. For open flux with guidance embedding
+        self.bypass_guidance_embedding = kwargs.get('bypass_guidance_embedding', False)
+        
+        # diffusion feature extractor
+        self.diffusion_feature_extractor_path = kwargs.get('diffusion_feature_extractor_path', None)
+        self.diffusion_feature_extractor_weight = kwargs.get('diffusion_feature_extractor_weight', 1.0)
+        
+        # optimal noise pairing
+        self.optimal_noise_pairing_samples = kwargs.get('optimal_noise_pairing_samples', 1)
+        
+        # forces same noise for the same image at a given size.
+        self.force_consistent_noise = kwargs.get('force_consistent_noise', False)
+
+
+ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
 
 
 class ModelConfig:
@@ -407,6 +477,7 @@ class ModelConfig:
         self.is_auraflow: bool = kwargs.get('is_auraflow', False)
         self.is_v3: bool = kwargs.get('is_v3', False)
         self.is_flux: bool = kwargs.get('is_flux', False)
+        self.is_lumina2: bool = kwargs.get('is_lumina2', False)
         if self.is_pixart_sigma:
             self.is_pixart = True
         self.use_flux_cfg = kwargs.get('use_flux_cfg', False)
@@ -451,6 +522,9 @@ class ModelConfig:
 
         # only for flux for now
         self.quantize = kwargs.get("quantize", False)
+        self.quantize_te = kwargs.get("quantize_te", self.quantize)
+        self.qtype = kwargs.get("qtype", "qfloat8")
+        self.qtype_te = kwargs.get("qtype_te", "qfloat8")
         self.low_vram = kwargs.get("low_vram", False)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
@@ -458,10 +532,75 @@ class ModelConfig:
         # for targeting a specific layers
         self.ignore_if_contains: Optional[List[str]] = kwargs.get("ignore_if_contains", None)
         self.only_if_contains: Optional[List[str]] = kwargs.get("only_if_contains", None)
+        self.quantize_kwargs = kwargs.get("quantize_kwargs", {})
         
-        if self.ignore_if_contains is not None or self.only_if_contains is not None:
-            if not self.is_flux:
-                raise ValueError("ignore_if_contains and only_if_contains are only supported with flux models currently")
+        # splits the model over the available gpus WIP
+        self.split_model_over_gpus = kwargs.get("split_model_over_gpus", False)
+        if self.split_model_over_gpus and not self.is_flux:
+            raise ValueError("split_model_over_gpus is only supported with flux models currently")
+        self.split_model_other_module_param_count_scale = kwargs.get("split_model_other_module_param_count_scale", 0.3)
+        
+        self.te_name_or_path = kwargs.get("te_name_or_path", None)
+        
+        self.arch: ModelArch = kwargs.get("arch", None)
+        
+        # can be used to load the extras like text encoder or vae from here
+        # only setup for some models but will prevent having to download the te for
+        # 20 different model variants
+        self.extras_name_or_path = kwargs.get("extras_name_or_path", self.name_or_path)
+        
+        # kwargs to pass to the model
+        self.model_kwargs = kwargs.get("model_kwargs", {})
+        
+        # handle migrating to new model arch
+        if self.arch is not None:
+            # reverse the arch to the old style
+            if self.arch == 'sd2':
+                self.is_v2 = True
+            elif self.arch == 'sd3':
+                self.is_v3 = True
+            elif self.arch == 'sdxl':
+                self.is_xl = True
+            elif self.arch == 'pixart':
+                self.is_pixart = True
+            elif self.arch == 'pixart_sigma':
+                self.is_pixart_sigma = True
+            elif self.arch == 'auraflow':
+                self.is_auraflow = True
+            elif self.arch == 'flux':
+                self.is_flux = True
+            elif self.arch == 'lumina2':
+                self.is_lumina2 = True
+            elif self.arch == 'vega':
+                self.is_vega = True
+            elif self.arch == 'ssd':
+                self.is_ssd = True
+            else:
+                pass
+        if self.arch is None:
+            if kwargs.get('is_v2', False):
+                self.arch = 'sd2'
+            elif kwargs.get('is_v3', False):
+                self.arch = 'sd3'
+            elif kwargs.get('is_xl', False):
+                self.arch = 'sdxl'
+            elif kwargs.get('is_pixart', False):
+                self.arch = 'pixart'
+            elif kwargs.get('is_pixart_sigma', False):
+                self.arch = 'pixart_sigma'
+            elif kwargs.get('is_auraflow', False):
+                self.arch = 'auraflow'
+            elif kwargs.get('is_flux', False):
+                self.arch = 'flux'
+            elif kwargs.get('is_lumina2', False):
+                self.arch = 'lumina2'
+            elif kwargs.get('is_vega', False):
+                self.arch = 'vega'
+            elif kwargs.get('is_ssd', False):
+                self.arch = 'ssd'
+            else:
+                self.arch = 'sd1'
+        
 
 
 class EMAConfig:
@@ -548,6 +687,7 @@ class SliderConfig:
                 self.targets.append(target)
         print(f"Built {len(self.targets)} slider targets (with permutations)")
 
+ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask']
 
 class DatasetConfig:
     """
@@ -574,7 +714,10 @@ class DatasetConfig:
                 random_triggers = [line for line in random_triggers if line.strip() != '']
         self.random_triggers: List[str] = random_triggers
         self.random_triggers_max: int = kwargs.get('random_triggers_max', 1)
-        self.caption_ext: str = kwargs.get('caption_ext', None)
+        self.caption_ext: str = kwargs.get('caption_ext', '.txt')
+        # if caption_ext doesnt start with a dot, add it
+        if self.caption_ext and not self.caption_ext.startswith('.'):
+            self.caption_ext = '.' + self.caption_ext
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
         self.resolution: int = kwargs.get('resolution', 512)
@@ -590,7 +733,10 @@ class DatasetConfig:
         self.flip_x: bool = kwargs.get('flip_x', False)
         self.flip_y: bool = kwargs.get('flip_y', False)
         self.augments: List[str] = kwargs.get('augments', [])
-        self.control_path: str = kwargs.get('control_path', None)  # depth maps, etc
+        self.control_path: Union[str,List[str]] = kwargs.get('control_path', None)  # depth maps, etc
+        # inpaint images should be webp/png images with alpha channel. The alpha 0 (invisible) section will
+        # be the part conditioned to be inpainted. The alpha 1 (visible) section will be the part that is ignored
+        self.inpaint_path: Union[str,List[str]] = kwargs.get('inpaint_path', None)
         # instead of cropping ot match image, it will serve the full size control image (clip images ie for ip adapters)
         self.full_size_control_images: bool = kwargs.get('full_size_control_images', False)
         self.alpha_mask: bool = kwargs.get('alpha_mask', False)  # if true, will use alpha channel as mask
@@ -602,6 +748,7 @@ class DatasetConfig:
         self.mask_min_value: float = kwargs.get('mask_min_value', 0.0)  # min value for . 0 - 1
         self.poi: Union[str, None] = kwargs.get('poi',
                                                 None)  # if one is set and in json data, will be used as auto crop scale point of interes
+        self.use_short_captions: bool = kwargs.get('use_short_captions', False)  # if true, will use 'caption_short' from json
         self.num_repeats: int = kwargs.get('num_repeats', 1)  # number of times to repeat dataset
         # cache latents will store them in memory
         self.cache_latents: bool = kwargs.get('cache_latents', False)
@@ -645,6 +792,29 @@ class DatasetConfig:
         self.square_crop: bool = kwargs.get('square_crop', False)
         # apply same augmentations to control images. Usually want this true unless special case
         self.replay_transforms: bool = kwargs.get('replay_transforms', True)
+        
+        # for video
+        # if num_frames is greater than 1, the dataloader will look for video files.
+        # num_frames will be the number of frames in the training batch. If num_frames is 1, it will look for images
+        self.num_frames: int = kwargs.get('num_frames', 1)
+        # if true, will shrink video to our frames. For instance, if we have a video with 100 frames and num_frames is 10,
+        # we would pull frame 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 so they are evenly spaced
+        self.shrink_video_to_frames: bool = kwargs.get('shrink_video_to_frames', True)
+        # fps is only used if shrink_video_to_frames is false. This will attempt to pull the num_frames at the given fps
+        # it will select a random start frame and pull the frames at the given fps
+        # this could have various issues with shorter videos and videos with variable fps
+        # I recommend trimming your videos to the desired length and using shrink_video_to_frames(default)
+        self.fps: int = kwargs.get('fps', 16)
+        
+        # debug the frame count and frame selection. You dont need this. It is for debugging.
+        self.debug: bool = kwargs.get('debug', False)
+        
+        # automatic controls
+        self.controls: List[ControlTypes] = kwargs.get('controls', [])
+        if isinstance(self.controls, str):
+            self.controls = [self.controls]
+        # remove empty strings
+        self.controls = [control for control in self.controls if control.strip() != '']
 
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
@@ -695,6 +865,9 @@ class GenerateImageConfig:
             refiner_start_at: float = 0.5,  # start at this percentage of a step. 0.0 to 1.0 . 1.0 is the end
             extra_values: List[float] = None,  # extra values to save with prompt file
             logger: Optional[EmptyLogger] = None,
+            num_frames: int = 1,
+            fps: int = 15,
+            ctrl_idx: int = 0
     ):
         self.width: int = width
         self.height: int = height
@@ -723,6 +896,11 @@ class GenerateImageConfig:
         self.extra_kwargs = extra_kwargs if extra_kwargs is not None else {}
         self.refiner_start_at = refiner_start_at
         self.extra_values = extra_values if extra_values is not None else []
+        self.num_frames = num_frames
+        self.fps = fps
+        self.ctrl_img = None
+        self.ctrl_idx = ctrl_idx
+        
 
         # prompt string will override any settings above
         self._process_prompt_string()
@@ -789,11 +967,32 @@ class GenerateImageConfig:
         # make parent dirs
         os.makedirs(self.output_folder, exist_ok=True)
         self.set_gen_time()
-        # TODO save image gen header info for A1111 and us, our seeds probably wont match
-        image.save(self.get_image_path(count, max_count))
-        # do prompt file
-        if self.add_prompt_file:
-            self.save_prompt_file(count, max_count)
+        if isinstance(image, list):
+            # video
+            if self.num_frames == 1:
+                raise ValueError(f"Expected 1 img but got a list {len(image)}")
+            if self.num_frames > 1 and self.output_ext not in ['webp']:
+                self.output_ext = 'webp'
+            if self.output_ext == 'webp':
+                # save as animated webp
+                duration = 1000 // self.fps  # Convert fps to milliseconds per frame
+                image[0].save(
+                    self.get_image_path(count, max_count),
+                    format='WEBP',
+                    append_images=image[1:],
+                    save_all=True,
+                    duration=duration,  # Duration per frame in milliseconds
+                    loop=0,  # 0 means loop forever
+                    quality=80  # Quality setting (0-100)
+                )
+            else:
+                raise ValueError(f"Unsupported video format {self.output_ext}")
+        else:
+            # TODO save image gen header info for A1111 and us, our seeds probably wont match
+            image.save(self.get_image_path(count, max_count))
+            # do prompt file
+            if self.add_prompt_file:
+                self.save_prompt_file(count, max_count)
 
     def save_prompt_file(self, count: int = 0, max_count=0):
         # save prompt file
@@ -814,7 +1013,10 @@ class GenerateImageConfig:
             prompt += ' --gr ' + str(self.guidance_rescale)
 
             # get gen info
-            f.write(self.prompt)
+            try:
+                f.write(self.prompt)
+            except Exception as e:
+                print(f"Error writing prompt file. Prompt contains non-unicode characters. {e}")
 
     def _process_prompt_string(self):
         # we will try to support all sd-scripts where we can
@@ -889,6 +1091,16 @@ class GenerateImageConfig:
                     elif flag == 'extra_values':
                         # split by comma
                         self.extra_values = [float(val) for val in content.split(',')]
+                    elif flag == 'frames':
+                        self.num_frames = int(content)
+                    elif flag == 'num_frames':
+                        self.num_frames = int(content)
+                    elif flag == 'fps':
+                        self.fps = int(content)
+                    elif flag == 'ctrl_img':
+                        self.ctrl_img = content
+                    elif flag == 'ctrl_idx':
+                        self.ctrl_idx = int(content)
 
     def post_process_embeddings(
             self,
@@ -914,4 +1126,6 @@ def validate_configs(
         if save_config.save_format != 'diffusers':
             # make it diffusers
             save_config.save_format = 'diffusers'
-        
+        if model_config.use_flux_cfg:
+            # bypass the embedding
+            train_config.bypass_guidance_embedding = True
