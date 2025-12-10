@@ -55,7 +55,7 @@ RUN pip install --pre --no-cache-dir torch torchvision torchaudio --index-url ht
 ARG CACHEBUST=1234
 ARG GIT_COMMIT=main
 RUN echo "Cache bust: ${CACHEBUST}" && \
-    git clone https://github.com/ostris/ai-toolkit.git && \
+    git clone https://github.com/sejoung/ai-toolkit.git && \
     cd ai-toolkit && \
     git checkout ${GIT_COMMIT}
 
@@ -63,7 +63,7 @@ WORKDIR /app/ai-toolkit
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --pre --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128 --force && \
+    pip install --pre --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 --force && \
     pip install setuptools==69.5.1 --no-cache-dir
 
 # Build UI
