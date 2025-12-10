@@ -21,6 +21,7 @@ import torch
 import torch.backends.cuda
 from huggingface_hub import HfApi, Repository, interpreter_login
 from huggingface_hub.utils import HfFolder
+from toolkit.memory_management import MemoryManager
 
 from toolkit.basic import value_map
 from toolkit.clip_vision_adapter import ClipVisionAdapter
@@ -62,13 +63,14 @@ from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, Netw
     DecoratorConfig
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
-from toolkit.accelerator import get_accelerator
+from toolkit.accelerator import get_accelerator, unwrap_model
 from toolkit.print import print_acc
 from accelerate import Accelerator
 import transformers
 import diffusers
 import hashlib
 
+from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 
 def flush():
@@ -144,10 +146,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
             raw_datasets = preprocess_dataset_raw_config(raw_datasets)
         self.datasets = None
         self.datasets_reg = None
+        self.dataset_configs: List[DatasetConfig] = []
         self.params = []
+        
+        # add dataset text embedding cache to their config
+        if self.train_config.cache_text_embeddings:
+            for raw_dataset in raw_datasets:
+                raw_dataset['cache_text_embeddings'] = True
+        
         if raw_datasets is not None and len(raw_datasets) > 0:
             for raw_dataset in raw_datasets:
                 dataset = DatasetConfig(**raw_dataset)
+                # handle trigger word per dataset
+                if dataset.trigger_word is None and self.trigger_word is not None:
+                    dataset.trigger_word = self.trigger_word
                 is_caching = dataset.cache_latents or dataset.cache_latents_to_disk
                 if not is_caching:
                     self.is_latents_cached = False
@@ -159,6 +171,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.datasets is None:
                         self.datasets = []
                     self.datasets.append(dataset)
+                self.dataset_configs.append(dataset)
+        
+        self.is_caching_text_embeddings = any(
+            dataset.cache_text_embeddings for dataset in self.dataset_configs
+        )
 
         self.embed_config = None
         embedding_raw = self.get_conf('embedding', None)
@@ -205,7 +222,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             train_embedding=self.embed_config is not None,
             train_decorator=self.decorator_config is not None,
             train_refiner=self.train_config.train_refiner,
-            unload_text_encoder=self.train_config.unload_text_encoder,
+            unload_text_encoder=self.train_config.unload_text_encoder or self.is_caching_text_embeddings,
             require_grads=False  # we ensure them later
         )
         
@@ -219,7 +236,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             train_embedding=self.embed_config is not None,
             train_decorator=self.decorator_config is not None,
             train_refiner=self.train_config.train_refiner,
-            unload_text_encoder=self.train_config.unload_text_encoder,
+            unload_text_encoder=self.train_config.unload_text_encoder or self.is_caching_text_embeddings,
             require_grads=True  # We check for grads when getting params
         )
 
@@ -234,7 +251,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.snr_gos: Union[LearnableSNRGamma, None] = None
         self.ema: ExponentialMovingAverage = None
         
-        validate_configs(self.train_config, self.model_config, self.save_config)
+        validate_configs(self.train_config, self.model_config, self.save_config, self.dataset_configs)
+        
+        do_profiler = self.get_conf('torch_profiler', False)
+        self.torch_profiler = None if not do_profiler else torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+        )
+        
+        self.current_boundary_index = 0
+        self.steps_this_boundary = 0
+        self.num_consecutive_oom = 0
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -292,25 +321,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
             extra_args = {}
             if self.adapter_config is not None and self.adapter_config.test_img_path is not None:
                 extra_args['adapter_image_path'] = test_image_paths[i]
+            
+            sample_item = sample_config.samples[i]
+            if sample_item.seed is not None:
+                current_seed = sample_item.seed
 
             gen_img_config_list.append(GenerateImageConfig(
                 prompt=prompt,  # it will autoparse the prompt
-                width=sample_config.width,
-                height=sample_config.height,
-                negative_prompt=sample_config.neg,
+                width=sample_item.width,
+                height=sample_item.height,
+                negative_prompt=sample_item.neg,
                 seed=current_seed,
-                guidance_scale=sample_config.guidance_scale,
+                guidance_scale=sample_item.guidance_scale,
                 guidance_rescale=sample_config.guidance_rescale,
-                num_inference_steps=sample_config.sample_steps,
-                network_multiplier=sample_config.network_multiplier,
+                num_inference_steps=sample_item.sample_steps,
+                network_multiplier=sample_item.network_multiplier,
                 output_path=output_path,
                 output_ext=sample_config.ext,
                 adapter_conditioning_scale=sample_config.adapter_conditioning_scale,
                 refiner_start_at=sample_config.refiner_start_at,
                 extra_values=sample_config.extra_values,
                 logger=self.logger,
-                num_frames=sample_config.num_frames,
-                fps=sample_config.fps,
+                num_frames=sample_item.num_frames,
+                fps=sample_item.fps,
+                ctrl_img=sample_item.ctrl_img,
+                ctrl_idx=sample_item.ctrl_idx,
+                ctrl_img_1=sample_item.ctrl_img_1,
+                ctrl_img_2=sample_item.ctrl_img_2,
+                ctrl_img_3=sample_item.ctrl_img_3,
+                do_cfg_norm=sample_config.do_cfg_norm,
                 **extra_args
             ))
 
@@ -341,11 +380,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         })
         o_dict['ss_base_model_version'] = self.sd.get_base_model_version()
 
-        o_dict = add_base_model_info_to_meta(
-            o_dict,
-            is_v2=self.model_config.is_v2,
-            is_xl=self.model_config.is_xl,
-        )
+        # o_dict = add_base_model_info_to_meta(
+        #     o_dict,
+        #     is_v2=self.model_config.is_v2,
+        #     is_xl=self.model_config.is_xl,
+        # )
         o_dict['ss_output_name'] = self.job.name
 
         if self.trigger_word is not None:
@@ -406,19 +445,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Combine and sort the lists
             combined_items = safetensors_files + directories + pt_files
             combined_items.sort(key=os.path.getctime)
+            
+            num_saves_to_keep = self.save_config.max_step_saves_to_keep
+            
+            if hasattr(self.sd, 'max_step_saves_to_keep_multiplier'):
+                num_saves_to_keep *= self.sd.max_step_saves_to_keep_multiplier
 
             # Use slicing with a check to avoid 'NoneType' error
             safetensors_to_remove = safetensors_files[
-                                    :-self.save_config.max_step_saves_to_keep] if safetensors_files else []
-            pt_files_to_remove = pt_files[:-self.save_config.max_step_saves_to_keep] if pt_files else []
-            directories_to_remove = directories[:-self.save_config.max_step_saves_to_keep] if directories else []
-            embeddings_to_remove = embed_files[:-self.save_config.max_step_saves_to_keep] if embed_files else []
-            critic_to_remove = critic_items[:-self.save_config.max_step_saves_to_keep] if critic_items else []
+                                    :-num_saves_to_keep] if safetensors_files else []
+            pt_files_to_remove = pt_files[:-num_saves_to_keep] if pt_files else []
+            directories_to_remove = directories[:-num_saves_to_keep] if directories else []
+            embeddings_to_remove = embed_files[:-num_saves_to_keep] if embed_files else []
+            critic_to_remove = critic_items[:-num_saves_to_keep] if critic_items else []
 
             items_to_remove = safetensors_to_remove + pt_files_to_remove + directories_to_remove + embeddings_to_remove + critic_to_remove
 
             # remove all but the latest max_step_saves_to_keep
-            # items_to_remove = combined_items[:-self.save_config.max_step_saves_to_keep]
+            # items_to_remove = combined_items[:-num_saves_to_keep]
 
             # remove duplicates
             items_to_remove = list(dict.fromkeys(items_to_remove))
@@ -574,10 +618,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     direct_save = False
                     if self.adapter_config.train_only_image_encoder:
                         direct_save = True
-                    if self.adapter_config.type == 'redux':
-                        direct_save = True
-                    if self.adapter_config.type in ['control_lora', 'subpixel', 'i2v']:
-                        direct_save = True
+                    elif isinstance(self.adapter, CustomAdapter):
+                        direct_save = self.adapter.do_direct_save
                     save_ip_adapter_from_diffusers(
                         state_dict,
                         output_file=file_path,
@@ -628,7 +670,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             try:
                 filename = f'optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
-                state_dict = self.optimizer.state_dict()
+                try:
+                    state_dict = unwrap_model(self.optimizer).state_dict()
+                except Exception as e:
+                    state_dict = self.optimizer.state_dict()
                 torch.save(state_dict, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
             except Exception as e:
@@ -903,7 +948,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return noise
             
 
-    def get_noise(self, latents, batch_size, dtype=torch.float32, batch: 'DataLoaderBatchDTO' = None):
+    def get_noise(
+        self, 
+        latents, 
+        batch_size, 
+        dtype=torch.float32, 
+        batch: 'DataLoaderBatchDTO' = None,
+        timestep=None,
+    ):
         if self.train_config.optimal_noise_pairing_samples > 1:
             noise = self.get_optimal_noise(latents, dtype=dtype)
         elif self.train_config.force_consistent_noise:
@@ -912,7 +964,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             noise = self.get_consistent_noise(latents, batch, dtype=dtype)
         else:
             if hasattr(self.sd, 'get_latent_noise_from_latents'):
-                noise = self.sd.get_latent_noise_from_latents(latents).to(self.device_torch, dtype=dtype)
+                noise = self.sd.get_latent_noise_from_latents(
+                    latents,
+                    noise_offset=self.train_config.noise_offset
+                ).to(self.device_torch, dtype=dtype)
             else:
                 # get noise
                 noise = self.sd.get_latent_noise(
@@ -922,23 +977,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     batch_size=batch_size,
                     noise_offset=self.train_config.noise_offset,
                 ).to(self.device_torch, dtype=dtype)
-
-        if self.train_config.random_noise_shift > 0.0:
-            # get random noise -1 to 1
-            noise_shift = torch.rand((noise.shape[0], noise.shape[1], 1, 1), device=noise.device,
-                                     dtype=noise.dtype) * 2 - 1
-
-            # multiply by shift amount
-            noise_shift *= self.train_config.random_noise_shift
-
-            # add to noise
-            noise += noise_shift
-
-        # standardize the noise
-        # shouldnt be needed?
-        # std = noise.std(dim=(2, 3), keepdim=True)
-        # normalizer = 1 / (std + 1e-6)
-        # noise = noise * normalizer
+        
+        if self.train_config.blended_blur_noise:
+            noise = get_blended_blur_noise(
+                latents, noise, timestep
+            )
 
         return noise
 
@@ -1076,19 +1119,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # we determine noise from the differential of the latents
                     unaugmented_latents = self.sd.encode_images(batch.unaugmented_tensor)
 
-            batch_size = len(batch.file_items)
-            min_noise_steps = self.train_config.min_denoising_steps
-            max_noise_steps = self.train_config.max_denoising_steps
-            if self.model_config.refiner_name_or_path is not None:
-                # if we are not training the unet, then we are only doing refiner and do not need to double up
-                if self.train_config.train_unet:
-                    max_noise_steps = round(self.train_config.max_denoising_steps * self.model_config.refiner_start_at)
-                    do_double = True
-                else:
-                    min_noise_steps = round(self.train_config.max_denoising_steps * self.model_config.refiner_start_at)
-                    do_double = False
+            with self.timer('prepare_scheduler'):
+                
+                batch_size = len(batch.file_items)
+                min_noise_steps = self.train_config.min_denoising_steps
+                max_noise_steps = self.train_config.max_denoising_steps
+                if self.model_config.refiner_name_or_path is not None:
+                    # if we are not training the unet, then we are only doing refiner and do not need to double up
+                    if self.train_config.train_unet:
+                        max_noise_steps = round(self.train_config.max_denoising_steps * self.model_config.refiner_start_at)
+                        do_double = True
+                    else:
+                        min_noise_steps = round(self.train_config.max_denoising_steps * self.model_config.refiner_start_at)
+                        do_double = False
 
-            with self.timer('prepare_noise'):
                 num_train_timesteps = self.train_config.num_train_timesteps
 
                 if self.train_config.noise_scheduler in ['custom_lcm']:
@@ -1105,14 +1149,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.train_config.linear_timesteps,
                         self.train_config.linear_timesteps2,
                         self.train_config.timestep_type == 'linear',
+                        self.train_config.timestep_type == 'one_step',
                     ])
                     
                     timestep_type = 'linear' if linear_timesteps else None
                     if timestep_type is None:
                         timestep_type = self.train_config.timestep_type
                     
+                    if self.train_config.timestep_type == 'next_sample':
+                        # simulate a sample
+                        num_train_timesteps = self.train_config.next_sample_timesteps
+                        timestep_type = 'shift'
+                    
                     patch_size = 1
-                    if self.sd.is_flux:
+                    if self.sd.is_flux or 'flex' in self.sd.arch:
                         # flux is a patch size of 1, but latents are divided by 2, so we need to double it
                         patch_size = 2
                     elif hasattr(self.sd.unet.config, 'patch_size'):
@@ -1129,13 +1179,42 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.sd.noise_scheduler.set_timesteps(
                         num_train_timesteps, device=self.device_torch
                     )
+            if self.sd.is_multistage:
+                with self.timer('adjust_multistage_timesteps'):
+                    # get our current sample range
+                    boundaries = [1] + self.sd.multistage_boundaries
+                    boundary_max, boundary_min = boundaries[self.current_boundary_index], boundaries[self.current_boundary_index + 1]
+                    asc_timesteps = torch.flip(self.sd.noise_scheduler.timesteps, dims=[0])
+                    lo = len(asc_timesteps) - torch.searchsorted(asc_timesteps, torch.tensor(boundary_max * 1000, device=asc_timesteps.device), right=False)
+                    hi = len(asc_timesteps) - torch.searchsorted(asc_timesteps, torch.tensor(boundary_min * 1000, device=asc_timesteps.device), right=True)
+                    first_idx = (lo - 1).item() if hi > lo else 0
+                    last_idx  = (hi - 1).item() if hi > lo else 999
+                    min_noise_steps = first_idx
+                    max_noise_steps = last_idx
+
+            # clip min max indicies
+            min_noise_steps = max(min_noise_steps, 0)
+            max_noise_steps = min(max_noise_steps, num_train_timesteps - 1)
+            
+                    
+            with self.timer('prepare_timesteps_indices'):
 
                 content_or_style = self.train_config.content_or_style
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
                 # if self.train_config.timestep_sampling == 'style' or self.train_config.timestep_sampling == 'content':
-                if content_or_style in ['style', 'content']:
+                if self.train_config.timestep_type == 'next_sample':
+                    timestep_indices = torch.randint(
+                            0,
+                            num_train_timesteps - 2, # -1 for 0 idx, -1 so we can step
+                            (batch_size,),
+                            device=self.device_torch
+                        )
+                    timestep_indices = timestep_indices.long()
+                elif self.train_config.timestep_type == 'one_step':
+                    timestep_indices = torch.zeros((batch_size,), device=self.device_torch, dtype=torch.long)
+                elif content_or_style in ['style', 'content']:
                     # this is from diffusers training code
                     # Cubic sampling for favoring later or earlier timesteps
                     # For more details about why cubic sampling is used for content / structure,
@@ -1156,44 +1235,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         0,
                         self.train_config.num_train_timesteps - 1,
                         min_noise_steps,
-                        max_noise_steps - 1
+                        max_noise_steps
                     )
                     timestep_indices = timestep_indices.long().clamp(
-                        min_noise_steps + 1,
-                        max_noise_steps - 1
+                        min_noise_steps,
+                        max_noise_steps
                     )
-
+                    
                 elif content_or_style == 'balanced':
                     if min_noise_steps == max_noise_steps:
                         timestep_indices = torch.ones((batch_size,), device=self.device_torch) * min_noise_steps
                     else:
                         # todo, some schedulers use indices, otheres use timesteps. Not sure what to do here
+                        min_idx = min_noise_steps + 1
+                        max_idx = max_noise_steps - 1
+                        if self.train_config.noise_scheduler == 'flowmatch':
+                            # flowmatch uses indices, so we need to use indices
+                            min_idx = min_noise_steps
+                            max_idx = max_noise_steps
                         timestep_indices = torch.randint(
-                            min_noise_steps + 1,
-                            max_noise_steps - 1,
+                            min_idx,
+                            max_idx,
                             (batch_size,),
                             device=self.device_torch
                         )
                     timestep_indices = timestep_indices.long()
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
-
-                # do flow matching
-                # if self.sd.is_flow_matching:
-                #     u = compute_density_for_timestep_sampling(
-                #         weighting_scheme="logit_normal",  # ["sigma_sqrt", "logit_normal", "mode", "cosmap"]
-                #         batch_size=batch_size,
-                #         logit_mean=0.0,
-                #         logit_std=1.0,
-                #         mode_scale=1.29,
-                #     )
-                #     timestep_indices = (u * self.sd.noise_scheduler.config.num_train_timesteps).long()
+            with self.timer('convert_timestep_indices_to_timesteps'):
                 # convert the timestep_indices to a timestep
-                timesteps = [self.sd.noise_scheduler.timesteps[x.item()] for x in timestep_indices]
-                timesteps = torch.stack(timesteps, dim=0)
-
+                timesteps = self.sd.noise_scheduler.timesteps[timestep_indices.long()]
+                
+            with self.timer('prepare_noise'):
                 # get noise
-                noise = self.get_noise(latents, batch_size, dtype=dtype, batch=batch)
+                noise = self.get_noise(latents, batch_size, dtype=dtype, batch=batch, timestep=timesteps)
 
                 # add dynamic noise offset. Dynamic noise is offsetting the noise to the same channelwise mean as the latents
                 # this will negate any noise offsets
@@ -1211,8 +1286,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     latents = unaugmented_latents
 
                 noise_multiplier = self.train_config.noise_multiplier
+                
+                s = (noise.shape[0], noise.shape[1], 1, 1)
+                if len(noise.shape) == 5:
+                    # if we have a 5d tensor, then we need to do it on a per batch item, per channel basis, per frame
+                    s = (noise.shape[0], noise.shape[1], noise.shape[2], 1, 1)
+                
+                if self.train_config.random_noise_multiplier > 0.0:
+                    
+                    # do it on a per batch item, per channel basis
+                    noise_multiplier = 1 + torch.randn(
+                        s,
+                        device=noise.device,
+                        dtype=noise.dtype
+                    ) * self.train_config.random_noise_multiplier
+                
+            with self.timer('make_noisy_latents'):
 
                 noise = noise * noise_multiplier
+                
+                if self.train_config.random_noise_shift > 0.0:
+                    # get random noise -1 to 1
+                    noise_shift = torch.randn(
+                        s,  
+                        device=noise.device,
+                        dtype=noise.dtype
+                    ) * self.train_config.random_noise_shift
+                    # add to noise
+                    noise += noise_shift
 
                 latent_multiplier = self.train_config.latent_multiplier
 
@@ -1450,7 +1551,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.load_training_state_from_metadata(previous_refiner_save)
 
         self.sd = ModelClass(
-            device=self.device,
+            # todo handle single gpu and multi gpu here
+            # device=self.device,
+            device=self.accelerator.device,
             model_config=model_config_to_load,
             dtype=self.train_config.dtype,
             custom_pipeline=self.custom_pipeline,
@@ -1461,6 +1564,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # run base sd process run
         self.sd.load_model()
         
+        # compile the model if needed
+        if self.model_config.compile:
+            try:
+                torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
+            except Exception as e:
+                print_acc(f"Failed to compile model: {e}")
+                print_acc("Continuing without compilation")
+
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
         dtype = get_torch_dtype(self.train_config.dtype)
@@ -1480,6 +1591,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # if it has it
                     if hasattr(te, 'enable_xformers_memory_efficient_attention'):
                         te.enable_xformers_memory_efficient_attention()
+        
+        if self.train_config.attention_backend != 'native':
+            if hasattr(vae, 'set_attention_backend'):
+                vae.set_attention_backend(self.train_config.attention_backend)
+            if hasattr(unet, 'set_attention_backend'):
+                unet.set_attention_backend(self.train_config.attention_backend)
+            if isinstance(text_encoder, list):
+                for te in text_encoder:
+                    if hasattr(te, 'set_attention_backend'):
+                        te.set_attention_backend(self.train_config.attention_backend)
+            else:
+                if hasattr(text_encoder, 'set_attention_backend'):
+                    text_encoder.set_attention_backend(self.train_config.attention_backend)
         if self.train_config.sdp:
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True)
@@ -1591,7 +1715,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 self.network = NetworkClass(
                     text_encoder=text_encoder,
-                    unet=unet,
+                    unet=self.sd.get_model_to_train(),
                     lora_dim=self.network_config.linear,
                     multiplier=1.0,
                     alpha=self.network_config.linear_alpha,
@@ -1636,7 +1760,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
                 # we cannot merge in if quantized
-                if self.model_config.quantize:
+                if self.model_config.quantize or self.model_config.layer_offloading:
                     # todo find a way around this
                     self.network.can_merge_in = False
 
@@ -1688,6 +1812,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
                     self.network.multiplier = 1.0
+                
+                if self.network_config.layer_offloading:
+                    MemoryManager.attach(
+                        self.network,
+                        self.device_torch
+                    )
 
             if self.embed_config is not None:
                 # we are doing embedding training as well
@@ -1817,15 +1947,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for group in optimizer.param_groups:
                 previous_lrs.append(group['lr'])
 
-            try:
-                print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
-                optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
-                optimizer.load_state_dict(optimizer_state_dict)
-                del optimizer_state_dict
-                flush()
-            except Exception as e:
-                print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
-                print_acc(e)
+            load_optimizer = True
+            if self.network is not None:
+                if self.network.did_change_weights:
+                    # do not load optimizer if the network changed, it will result in
+                    # a double state that will oom.
+                    load_optimizer = False
+
+            if load_optimizer:
+                try:
+                    print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
+                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                    optimizer.load_state_dict(optimizer_state_dict)
+                    del optimizer_state_dict
+                    flush()
+                except Exception as e:
+                    print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
+                    print_acc(e)
 
             # update the optimizer LR from the params
             print_acc(f"Updating optimizer LR from params")
@@ -1924,10 +2062,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         start_step_num = self.step_num
         did_first_flush = False
+        flush_next = False
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
             self.timer.start('train_loop')
+            if flush_next:
+                flush()
+                flush_next = False
             if self.train_config.do_random_cfg:
                 self.train_config.do_cfg = True
                 self.train_config.cfg_scale = value_map(random.random(), 0, 1, 1.0, self.train_config.max_cfg_scale)
@@ -2011,18 +2153,41 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             # flush()
             ### HOOK ###
-            with self.accelerator.accumulate(self.modules_being_trained):
-                try:
+            if self.torch_profiler is not None:
+                self.torch_profiler.start()
+            did_oom = False
+            loss_dict = None
+            try:
+                with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
-                except Exception as e:
-                    traceback.print_exc()
-                    #print batch info
-                    print("Batch Items:")
-                    for batch in batch_list:
-                        for item in batch.file_items:
-                            print(f" - {item.path}")
-                    raise e
-                    
+            except torch.cuda.OutOfMemoryError:
+                did_oom = True
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    did_oom = True
+                else:
+                    raise  # not an OOM; surface real errors
+            if did_oom:
+                self.num_consecutive_oom += 1
+                if self.num_consecutive_oom > 3:
+                    raise RuntimeError("OOM during training step 3 times in a row, aborting training")
+                optimizer.zero_grad(set_to_none=True)
+                flush()
+                torch.cuda.ipc_collect()
+                # skip this step and keep going
+                print_acc("")
+                print_acc("################################################")
+                print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
+                print_acc("################################################")
+                print_acc("")
+            else:
+                self.num_consecutive_oom = 0
+            if self.torch_profiler is not None:
+                torch.cuda.synchronize()  # Make sure all CUDA ops are done
+                self.torch_profiler.stop()
+                
+                print("\n==== Profile Results ====")
+                print(self.torch_profiler.key_averages().table(sort_by="cpu_time_total", row_limit=1000))
             self.timer.stop('train_loop')
             if not did_first_flush:
                 flush()
@@ -2035,25 +2200,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with torch.no_grad():
                 # torch.cuda.empty_cache()
                 # if optimizer has get_lrs method, then use it
-                if hasattr(optimizer, 'get_avg_learning_rate'):
-                    learning_rate = optimizer.get_avg_learning_rate()
-                elif hasattr(optimizer, 'get_learning_rates'):
-                    learning_rate = optimizer.get_learning_rates()[0]
-                elif self.train_config.optimizer.lower().startswith('dadaptation') or \
-                        self.train_config.optimizer.lower().startswith('prodigy'):
-                    learning_rate = (
-                            optimizer.param_groups[0]["d"] *
-                            optimizer.param_groups[0]["lr"]
-                    )
-                else:
-                    learning_rate = optimizer.param_groups[0]['lr']
+                if not did_oom and loss_dict is not None:
+                    if hasattr(optimizer, 'get_avg_learning_rate'):
+                        learning_rate = optimizer.get_avg_learning_rate()
+                    elif hasattr(optimizer, 'get_learning_rates'):
+                        learning_rate = optimizer.get_learning_rates()[0]
+                    elif self.train_config.optimizer.lower().startswith('dadaptation') or \
+                            self.train_config.optimizer.lower().startswith('prodigy'):
+                        learning_rate = (
+                                optimizer.param_groups[0]["d"] *
+                                optimizer.param_groups[0]["lr"]
+                        )
+                    else:
+                        learning_rate = optimizer.param_groups[0]['lr']
 
-                prog_bar_string = f"lr: {learning_rate:.1e}"
-                for key, value in loss_dict.items():
-                    prog_bar_string += f" {key}: {value:.3e}"
+                    prog_bar_string = f"lr: {learning_rate:.1e}"
+                    for key, value in loss_dict.items():
+                        prog_bar_string += f" {key}: {value:.3e}"
 
-                if self.progress_bar is not None:
-                    self.progress_bar.set_postfix_str(prog_bar_string)
+                    if self.progress_bar is not None:
+                        self.progress_bar.set_postfix_str(prog_bar_string)
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
                 if isinstance(batch, DataLoaderBatchDTO):
@@ -2064,6 +2230,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.step_num != self.start_step:
                     if is_sample_step or is_save_step:
                         self.accelerator.wait_for_everyone()
+                        
+                    if is_save_step:
+                        self.accelerator
+                        # print above the progress bar
+                        if self.progress_bar is not None:
+                            self.progress_bar.pause()
+                        print_acc(f"\nSaving at step {self.step_num}")
+                        self.save(self.step_num)
+                        self.ensure_params_requires_grad()
+                        # clear any grads
+                        optimizer.zero_grad()
+                        flush()
+                        flush_next = True
+                        if self.progress_bar is not None:
+                            self.progress_bar.unpause()
+                            
                     if is_sample_step:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
@@ -2077,17 +2259,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             self.sd.text_encoder_to('cpu')
                         flush()
 
-                        self.ensure_params_requires_grad()
-                        if self.progress_bar is not None:
-                            self.progress_bar.unpause()
-
-                    if is_save_step:
-                        self.accelerator
-                        # print above the progress bar
-                        if self.progress_bar is not None:
-                            self.progress_bar.pause()
-                        print_acc(f"\nSaving at step {self.step_num}")
-                        self.save(self.step_num)
                         self.ensure_params_requires_grad()
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()

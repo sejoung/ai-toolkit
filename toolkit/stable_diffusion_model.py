@@ -49,9 +49,8 @@ from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAda
     StableDiffusionXLImg2ImgPipeline, LCMScheduler, Transformer2DModel, AutoencoderTiny, ControlNetModel, \
     StableDiffusionXLControlNetPipeline, StableDiffusionControlNetPipeline, StableDiffusion3Pipeline, \
     StableDiffusion3Img2ImgPipeline, PixArtSigmaPipeline, AuraFlowPipeline, AuraFlowTransformer2DModel, FluxPipeline, \
-    FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel, Lumina2Text2ImgPipeline, \
-    FluxControlPipeline
-from toolkit.models.lumina2 import Lumina2Transformer2DModel
+    FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel, Lumina2Pipeline, \
+    FluxControlPipeline, Lumina2Transformer2DModel
 import diffusers
 from diffusers import \
     AutoencoderKL, \
@@ -142,15 +141,17 @@ class StableDiffusion:
     ):
         self.accelerator = get_accelerator()
         self.custom_pipeline = custom_pipeline
-        self.device = str(self.accelerator.device)
+        self.device = str(device)
+        if "cuda" in self.device and ":" not in self.device:
+            self.device = f"{self.device}:0"
+        self.device_torch = torch.device(device)
         self.dtype = dtype
         self.torch_dtype = get_torch_dtype(dtype)
-        self.device_torch = self.accelerator.device
 
-        self.vae_device_torch = self.accelerator.device
+        self.vae_device_torch = torch.device(device)
         self.vae_torch_dtype = get_torch_dtype(model_config.vae_dtype)
 
-        self.te_device_torch = self.accelerator.device
+        self.te_device_torch = torch.device(device)
         self.te_torch_dtype = get_torch_dtype(model_config.te_dtype)
 
         self.model_config = model_config
@@ -208,6 +209,21 @@ class StableDiffusion:
         # todo update this based on the model
         self.is_transformer = False
         
+        self.sample_prompts_cache = None
+        
+        self.is_multistage = False
+        # a list of multistage boundaries starting with train step 1000 to first idx
+        self.multistage_boundaries: List[float] = [0.0]
+        # a list of trainable multistage boundaries
+        self.trainable_multistage_boundaries: List[int] = [0]
+        
+        # set true for models that encode control image into text embeddings
+        self.encode_control_in_text_embeddings = False
+        # control images will come in as a list for encoding some things if true
+        self.has_multiple_control_images = False
+        # do not resize control images
+        self.use_raw_control_images = False
+        
     # properties for old arch for backwards compatibility
     @property
     def is_xl(self):
@@ -251,13 +267,13 @@ class StableDiffusion:
     
     def get_bucket_divisibility(self):
         if self.vae is None:
-            return 8
+            return 16
         divisibility = 2 ** (len(self.vae.config['block_out_channels']) - 1)
         
         # flux packs this again,
         if self.is_flux or self.is_v3:
             divisibility = divisibility * 2
-        return divisibility
+        return divisibility * 2 # todo remove this
         
 
     def load_model(self):
@@ -756,7 +772,10 @@ class StableDiffusion:
 
             scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model_path, subfolder="scheduler")
             self.print_and_status_update("Loading VAE")
-            vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae", torch_dtype=dtype)
+            if self.model_config.vae_path is not None:
+                vae = load_vae(self.model_config.vae_path, dtype)
+            else:
+                vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae", torch_dtype=dtype)
             flush()
             
             self.print_and_status_update("Loading T5")
@@ -882,7 +901,7 @@ class StableDiffusion:
                 flush()
 
             self.print_and_status_update("Making pipe")
-            pipe: Lumina2Text2ImgPipeline = Lumina2Text2ImgPipeline(
+            pipe: Lumina2Pipeline = Lumina2Pipeline(
                 scheduler=scheduler,
                 text_encoder=None,
                 tokenizer=tokenizer,
@@ -1130,6 +1149,8 @@ class StableDiffusion:
             # the network to drastically speed up inference
             unique_network_weights = set([x.network_multiplier for x in image_configs])
             if len(unique_network_weights) == 1 and network.can_merge_in:
+                # make sure it is on device before merging. 
+                self.unet.to(self.device_torch)
                 can_merge_in = True
                 merge_multiplier = unique_network_weights.pop()
                 network.merge_in(merge_weight=merge_multiplier)
@@ -1252,7 +1273,7 @@ class StableDiffusion:
                     
                 pipeline.watermark = None
             elif self.is_lumina2:
-                pipeline = Lumina2Text2ImgPipeline(
+                pipeline = Lumina2Pipeline(
                     vae=self.vae,
                     transformer=self.unet,
                     text_encoder=self.text_encoder,
@@ -1401,8 +1422,7 @@ class StableDiffusion:
                         conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image)
                         self.adapter(conditional_clip_embeds)
 
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter)  \
-                            and gen_config.adapter_image_path is not None:
+                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
                         # handle condition the prompts
                         gen_config.prompt = self.adapter.condition_prompt(
                             gen_config.prompt,
@@ -1423,18 +1443,22 @@ class StableDiffusion:
                             quad_count=4
                         )
 
-                    # encode the prompt ourselves so we can do fun stuff with embeddings
-                    if isinstance(self.adapter, CustomAdapter):
-                        self.adapter.is_unconditional_run = False
-                    conditional_embeds = self.encode_prompt(gen_config.prompt, gen_config.prompt_2, force_all=True)
+                    if self.sample_prompts_cache is not None:
+                        conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
+                        unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
+                    else: 
+                        # encode the prompt ourselves so we can do fun stuff with embeddings
+                        if isinstance(self.adapter, CustomAdapter):
+                            self.adapter.is_unconditional_run = False
+                        conditional_embeds = self.encode_prompt(gen_config.prompt, gen_config.prompt_2, force_all=True)
 
-                    if isinstance(self.adapter, CustomAdapter):
-                        self.adapter.is_unconditional_run = True
-                    unconditional_embeds = self.encode_prompt(
-                        gen_config.negative_prompt, gen_config.negative_prompt_2, force_all=True
-                    )
-                    if isinstance(self.adapter, CustomAdapter):
-                        self.adapter.is_unconditional_run = False
+                        if isinstance(self.adapter, CustomAdapter):
+                            self.adapter.is_unconditional_run = True
+                        unconditional_embeds = self.encode_prompt(
+                            gen_config.negative_prompt, gen_config.negative_prompt_2, force_all=True
+                        )
+                        if isinstance(self.adapter, CustomAdapter):
+                            self.adapter.is_unconditional_run = False
 
                     # allow any manipulations to take place to embeddings
                     gen_config.post_process_embeddings(
@@ -1456,7 +1480,7 @@ class StableDiffusion:
                         conditional_embeds = self.adapter(conditional_embeds, conditional_clip_embeds, is_unconditional=False)
                         unconditional_embeds = self.adapter(unconditional_embeds, unconditional_clip_embeds, is_unconditional=True)
 
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and validation_image is not None:
+                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
                         conditional_embeds = self.adapter.condition_encoded_embeds(
                             tensors_0_1=validation_image,
                             prompt_embeds=conditional_embeds,
@@ -1577,7 +1601,7 @@ class StableDiffusion:
                                 **extra
                             ).images[0]
                     elif self.is_lumina2:
-                        pipeline: Lumina2Text2ImgPipeline = pipeline
+                        pipeline: Lumina2Pipeline = pipeline
 
                         img = pipeline(
                             prompt_embeds=conditional_embeds.text_embeds,
@@ -1757,6 +1781,15 @@ class StableDiffusion:
             ),
             device=self.unet.device,
         )
+        noise = apply_noise_offset(noise, noise_offset)
+        return noise
+    
+    def get_latent_noise_from_latents(
+        self,
+        latents: torch.Tensor,
+        noise_offset=0.0
+    ):
+        noise = torch.randn_like(latents)
         noise = apply_noise_offset(noise, noise_offset)
         return noise
 
@@ -2084,7 +2117,10 @@ class StableDiffusion:
                     noise_pred = noise_pred
             else:
                 if self.unet.device != self.device_torch:
-                    self.unet.to(self.device_torch)
+                    try:
+                        self.unet.to(self.device_torch)
+                    except Exception as e:
+                        pass
                 if self.unet.dtype != self.torch_dtype:
                     self.unet = self.unet.to(dtype=self.torch_dtype)
                 if self.is_flux:
@@ -2163,7 +2199,7 @@ class StableDiffusion:
                         noise_pred = self.unet(
                             hidden_states=latent_model_input.to(self.device_torch, self.torch_dtype),
                             timestep=t,
-                            attention_mask=text_embeddings.attention_mask.to(self.device_torch, dtype=torch.int64),
+                            encoder_attention_mask=text_embeddings.attention_mask.to(self.device_torch, dtype=torch.int64),
                             encoder_hidden_states=text_embeddings.text_embeds.to(self.device_torch, self.torch_dtype),
                             **kwargs,
                         ).sample
@@ -2281,6 +2317,7 @@ class StableDiffusion:
             bleed_latents: torch.FloatTensor = None,
             is_input_scaled=False,
             return_first_prediction=False,
+            bypass_guidance_embedding=False,
             **kwargs,
     ):
         timesteps_to_run = self.noise_scheduler.timesteps[start_timesteps:total_timesteps]
@@ -2297,6 +2334,7 @@ class StableDiffusion:
                 add_time_ids=add_time_ids,
                 is_input_scaled=is_input_scaled,
                 return_conditional_pred=True,
+                bypass_guidance_embedding=bypass_guidance_embedding,
                 **kwargs,
             )
             # some schedulers need to run separately, so do that. (euler for example)
@@ -2327,6 +2365,7 @@ class StableDiffusion:
             long_prompts=False,
             max_length=None,
             dropout_prob=0.0,
+            control_images=None,
     ) -> PromptEmbeds:
         # sd1.5 embeddings are (bs, 77, 768)
         prompt = prompt
@@ -2477,7 +2516,7 @@ class StableDiffusion:
 
         latent_list = []
         # Move to vae to device if on cpu
-        if self.vae.device == 'cpu':
+        if self.vae.device == torch.device("cpu"):
             self.vae.to(device)
         self.vae.eval()
         self.vae.requires_grad_(False)
@@ -2519,9 +2558,9 @@ class StableDiffusion:
             dtype = self.torch_dtype
 
         # Move to vae to device if on cpu
-        if self.vae.device == 'cpu':
-            self.vae.to(self.device)
-        latents = latents.to(device, dtype=dtype)
+        if self.vae.device == torch.device("cpu"):
+            self.vae.to(self.device_torch)
+        latents = latents.to(self.device_torch, dtype=self.torch_dtype)
         latents = (latents / self.vae.config['scaling_factor']) + self.vae.config['shift_factor']
         images = self.vae.decode(latents).sample
         images = images.to(device, dtype=dtype)
@@ -2845,12 +2884,7 @@ class StableDiffusion:
     def save_device_state(self):
         # saves the current device state for all modules
         # this is useful for when we want to alter the state and restore it
-        if self.is_lumina2:
-            unet_has_grad = self.unet.x_embedder.weight.requires_grad
-        elif self.is_pixart or self.is_v3 or self.is_auraflow or self.is_flux:
-            unet_has_grad = self.unet.proj_out.weight.requires_grad
-        else:
-            unet_has_grad = self.unet.conv_in.weight.requires_grad
+        unet_has_grad = False
 
         self.device_state = {
             **empty_preset,
@@ -2873,7 +2907,7 @@ class StableDiffusion:
                     try:
                         te_has_grad = encoder.text_model.final_layer_norm.weight.requires_grad
                     except:
-                        te_has_grad = encoder.encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
+                        te_has_grad = False
                 self.device_state['text_encoder'].append({
                     'training': encoder.training,
                     'device': encoder.device,
@@ -3008,6 +3042,8 @@ class StableDiffusion:
             active_modules = ['vae']
         if device_state_preset in ['cache_clip']:
             active_modules = ['clip']
+        if device_state_preset in ['cache_text_encoder']:
+            active_modules = ['text_encoder']
         if device_state_preset in ['unload']:
             active_modules = []
         if device_state_preset in ['generate']:
@@ -3103,3 +3139,6 @@ class StableDiffusion:
         if self.is_v2:
             return 'sd_2.1'
         return 'sd_1.5'
+
+    def get_model_to_train(self):
+        return self.unet

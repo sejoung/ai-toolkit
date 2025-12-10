@@ -36,6 +36,7 @@ from diffusers import \
     UNet2DConditionModel
 from diffusers import PixArtAlphaPipeline
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection
+from torchvision.transforms import functional as TF
 
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
@@ -113,15 +114,15 @@ class BaseModel:
     ):
         self.accelerator = get_accelerator()
         self.custom_pipeline = custom_pipeline
-        self.device = str(self.accelerator.device)
+        self.device = device
         self.dtype = dtype
         self.torch_dtype = get_torch_dtype(dtype)
-        self.device_torch = self.accelerator.device
+        self.device_torch = torch.device(device)
 
-        self.vae_device_torch = self.accelerator.device
+        self.vae_device_torch = torch.device(device)
         self.vae_torch_dtype = get_torch_dtype(model_config.vae_dtype)
 
-        self.te_device_torch = self.accelerator.device
+        self.te_device_torch = torch.device(device)
         self.te_torch_dtype = get_torch_dtype(model_config.te_dtype)
 
         self.model_config = model_config
@@ -168,6 +169,22 @@ class BaseModel:
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
         self.is_transformer = False
+
+        self.sample_prompts_cache = None
+        
+        self.accuracy_recovery_adapter: Union[None, 'LoRASpecialNetwork'] = None
+        self.is_multistage = False
+        # a list of multistage boundaries starting with train step 1000 to first idx
+        self.multistage_boundaries: List[float] = [0.0]
+        # a list of trainable multistage boundaries
+        self.trainable_multistage_boundaries: List[int] = [0]
+        
+        # set true for models that encode control image into text embeddings
+        self.encode_control_in_text_embeddings = False
+        # control images will come in as a list for encoding some things if true
+        self.has_multiple_control_images = False
+        # do not resize control images
+        self.use_raw_control_images = False
 
     # properties for old arch for backwards compatibility
     @property
@@ -278,7 +295,7 @@ class BaseModel:
         raise NotImplementedError(
             "get_noise_prediction must be implemented in child classes")
 
-    def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
+    def get_prompt_embeds(self, prompt: str, control_images=None) -> PromptEmbeds:
         raise NotImplementedError(
             "get_prompt_embeds must be implemented in child classes")
         
@@ -343,7 +360,7 @@ class BaseModel:
             pipeline: Union[None, StableDiffusionPipeline,
                             StableDiffusionXLPipeline] = None,
     ):
-        network = unwrap_model(self.network)
+        network = self.network
         merge_multiplier = 1.0
         flush()
         # if using assistant, unfuse it
@@ -364,6 +381,7 @@ class BaseModel:
             self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
 
         if network is not None:
+            network = unwrap_model(self.network)
             network.eval()
             # check if we have the same network weight for all samples. If we do, we can merge in th
             # the network to drastically speed up inference
@@ -483,19 +501,80 @@ class BaseModel:
                             quad_count=4
                         )
 
-                    # encode the prompt ourselves so we can do fun stuff with embeddings
-                    if isinstance(self.adapter, CustomAdapter):
-                        self.adapter.is_unconditional_run = False
-                    conditional_embeds = self.encode_prompt(
-                        gen_config.prompt, gen_config.prompt_2, force_all=True)
+                    if self.sample_prompts_cache is not None:
+                        conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
+                        unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
+                    else:
+                        ctrl_img = None
+                        has_control_images = False
+                        if gen_config.ctrl_img is not None or gen_config.ctrl_img_1 is not None or gen_config.ctrl_img_2 is not None or gen_config.ctrl_img_3 is not None:
+                            has_control_images = True
+                        # load the control image if out model uses it in text encoding
+                        if has_control_images and self.encode_control_in_text_embeddings:
+                            ctrl_img_list = []
+                    
+                            if gen_config.ctrl_img is not None:
+                                ctrl_img = Image.open(gen_config.ctrl_img).convert("RGB")
+                                # convert to 0 to 1 tensor
+                                ctrl_img = (
+                                    TF.to_tensor(ctrl_img)
+                                    .unsqueeze(0)
+                                    .to(self.device_torch, dtype=self.torch_dtype)
+                                )
+                                ctrl_img_list.append(ctrl_img)
+                            
+                            if gen_config.ctrl_img_1 is not None:
+                                ctrl_img_1 = Image.open(gen_config.ctrl_img_1).convert("RGB")
+                                # convert to 0 to 1 tensor
+                                ctrl_img_1 = (
+                                    TF.to_tensor(ctrl_img_1)
+                                    .unsqueeze(0)
+                                    .to(self.device_torch, dtype=self.torch_dtype)
+                                )
+                                ctrl_img_list.append(ctrl_img_1)
+                            if gen_config.ctrl_img_2 is not None:
+                                ctrl_img_2 = Image.open(gen_config.ctrl_img_2).convert("RGB")
+                                # convert to 0 to 1 tensor
+                                ctrl_img_2 = (
+                                    TF.to_tensor(ctrl_img_2)
+                                    .unsqueeze(0)
+                                    .to(self.device_torch, dtype=self.torch_dtype)
+                                )
+                                ctrl_img_list.append(ctrl_img_2)
+                            if gen_config.ctrl_img_3 is not None:
+                                ctrl_img_3 = Image.open(gen_config.ctrl_img_3).convert("RGB")
+                                # convert to 0 to 1 tensor
+                                ctrl_img_3 = (
+                                    TF.to_tensor(ctrl_img_3)
+                                    .unsqueeze(0)
+                                    .to(self.device_torch, dtype=self.torch_dtype)
+                                )
+                                ctrl_img_list.append(ctrl_img_3)
+                            
+                            if self.has_multiple_control_images:
+                                ctrl_img = ctrl_img_list
+                            else:
+                                ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
+                        # encode the prompt ourselves so we can do fun stuff with embeddings
+                        if isinstance(self.adapter, CustomAdapter):
+                            self.adapter.is_unconditional_run = False
+                        conditional_embeds = self.encode_prompt(
+                            gen_config.prompt, 
+                            gen_config.prompt_2, 
+                            force_all=True,
+                            control_images=ctrl_img
+                        )
 
-                    if isinstance(self.adapter, CustomAdapter):
-                        self.adapter.is_unconditional_run = True
-                    unconditional_embeds = self.encode_prompt(
-                        gen_config.negative_prompt, gen_config.negative_prompt_2, force_all=True
-                    )
-                    if isinstance(self.adapter, CustomAdapter):
-                        self.adapter.is_unconditional_run = False
+                        if isinstance(self.adapter, CustomAdapter):
+                            self.adapter.is_unconditional_run = True
+                        unconditional_embeds = self.encode_prompt(
+                            gen_config.negative_prompt, 
+                            gen_config.negative_prompt_2, 
+                            force_all=True,
+                            control_images=ctrl_img
+                        )
+                        if isinstance(self.adapter, CustomAdapter):
+                            self.adapter.is_unconditional_run = False
 
                     # allow any manipulations to take place to embeddings
                     gen_config.post_process_embeddings(
@@ -724,9 +803,12 @@ class BaseModel:
         # then we are doing it, otherwise we are not and takes half the time.
         do_classifier_free_guidance = True
 
-        # check if batch size of embeddings matches batch size of latents
         if isinstance(text_embeddings.text_embeds, list):
-            te_batch_size = text_embeddings.text_embeds[0].shape[0]
+            if len(text_embeddings.text_embeds[0].shape) == 2:
+                # handle list of embeddings
+                te_batch_size = len(text_embeddings.text_embeds)
+            else:
+                te_batch_size = text_embeddings.text_embeds[0].shape[0]
         else:
             te_batch_size = text_embeddings.text_embeds.shape[0]
         if latents.shape[0] == te_batch_size:
@@ -814,7 +896,10 @@ class BaseModel:
 
         # predict the noise residual
         if self.unet.device != self.device_torch:
-            self.unet.to(self.device_torch)
+            try:
+                self.unet.to(self.device_torch)
+            except Exception as e:
+                pass
         if self.unet.dtype != self.torch_dtype:
             self.unet = self.unet.to(dtype=self.torch_dtype)
             
@@ -972,6 +1057,7 @@ class BaseModel:
             long_prompts=False,
             max_length=None,
             dropout_prob=0.0,
+            control_images=None,
     ) -> PromptEmbeds:
         # sd1.5 embeddings are (bs, 77, 768)
         prompt = prompt
@@ -981,6 +1067,9 @@ class BaseModel:
 
         if prompt2 is not None and not isinstance(prompt2, list):
             prompt2 = [prompt2]
+        # if control_images in the signature, pass it. This keep from breaking plugins
+        if self.encode_control_in_text_embeddings:
+            return self.get_prompt_embeds(prompt, control_images=control_images)
 
         return self.get_prompt_embeds(prompt)
 
@@ -998,7 +1087,7 @@ class BaseModel:
 
         latent_list = []
         # Move to vae to device if on cpu
-        if self.vae.device == 'cpu':
+        if self.vae.device == torch.device("cpu"):
             self.vae.to(device)
         self.vae.eval()
         self.vae.requires_grad_(False)
@@ -1015,7 +1104,7 @@ class BaseModel:
                 image_list[i] = Resize((image.shape[1] // VAE_SCALE_FACTOR * VAE_SCALE_FACTOR,
                                         image.shape[2] // VAE_SCALE_FACTOR * VAE_SCALE_FACTOR))(image)
 
-        images = torch.stack(image_list)
+        images = torch.stack(image_list).to(device, dtype=dtype)
         if isinstance(self.vae, AutoencoderTiny):
             latents = self.vae.encode(images, return_dict=False)[0]
         else:
@@ -1041,7 +1130,7 @@ class BaseModel:
             dtype = self.torch_dtype
 
         # Move to vae to device if on cpu
-        if self.vae.device == 'cpu':
+        if self.vae.device == torch.device('cpu'):
             self.vae.to(self.device)
         latents = latents.to(device, dtype=dtype)
         latents = (
@@ -1160,12 +1249,12 @@ class BaseModel:
             if self.model_config.ignore_if_contains is not None:
                 # remove params that contain the ignore_if_contains from named params
                 for key in list(named_params.keys()):
-                    if any([s in key for s in self.model_config.ignore_if_contains]):
+                    if any([s in f"transformer.{key}" for s in self.model_config.ignore_if_contains]):
                         del named_params[key]
             if self.model_config.only_if_contains is not None:
                 # remove params that do not contain the only_if_contains from named params
                 for key in list(named_params.keys()):
-                    if not any([s in key for s in self.model_config.only_if_contains]):
+                    if not any([s in f"transformer.{key}" for s in self.model_config.only_if_contains]):
                         del named_params[key]
 
         if refiner:
@@ -1490,3 +1579,7 @@ class BaseModel:
     def get_base_model_version(self) -> str:
         # override in child classes to get the base model version
         return "unknown"
+
+    def get_model_to_train(self):
+        # called to get model to attach LoRAs to. Can be overridden in child classes
+        return self.unet

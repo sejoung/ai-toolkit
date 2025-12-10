@@ -19,6 +19,7 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, Sigl
 from toolkit.basic import flush, value_map
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
 from toolkit.config_modules import ControlTypes
+from toolkit.control_generator import ControlGenerator
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
 from toolkit.prompt_utils import inject_trigger_into_prompt
@@ -28,6 +29,8 @@ from PIL.ImageOps import exif_transpose
 import albumentations as A
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
+from toolkit.prompt_utils import PromptEmbeds
+from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
 
@@ -110,12 +113,12 @@ class CaptionMixin:
         if not hasattr(self, 'file_list'):
             raise Exception('file_list not found on class instance')
         img_path_or_tuple = self.file_list[index]
+        ext = self.dataset_config.caption_ext
         if isinstance(img_path_or_tuple, tuple):
             img_path = img_path_or_tuple[0] if isinstance(img_path_or_tuple[0], str) else img_path_or_tuple[0].path
             # check if either has a prompt file
             path_no_ext = os.path.splitext(img_path)[0]
             prompt_path = None
-            ext = self.dataset_config.caption_ext
             prompt_path = path_no_ext + ext
         else:
             img_path = img_path_or_tuple if isinstance(img_path_or_tuple, str) else img_path_or_tuple.path
@@ -298,9 +301,10 @@ class CaptionProcessingDTOMixin:
 
             dataset_config: DatasetConfig = kwargs.get('dataset_config', None)
             self.extra_values: List[float] = dataset_config.extra_values
+            self.trigger_word = dataset_config.trigger_word
 
     # todo allow for loading from sd-scripts style dict
-    def load_caption(self: 'FileItemDTO', caption_dict: Union[dict, None]):
+    def load_caption(self: 'FileItemDTO', caption_dict: Union[dict, None]=None):
         if self.raw_caption is not None:
             # we already loaded it
             pass
@@ -314,7 +318,7 @@ class CaptionProcessingDTOMixin:
             # see if prompt file exists
             path_no_ext = os.path.splitext(self.path)[0]
             prompt_ext = self.dataset_config.caption_ext
-            prompt_path = f"{path_no_ext}.{prompt_ext}"
+            prompt_path = path_no_ext + prompt_ext
             short_caption = None
 
             if os.path.exists(prompt_path):
@@ -340,6 +344,9 @@ class CaptionProcessingDTOMixin:
                     prompt = clean_caption(prompt)
                     if short_caption is not None:
                         short_caption = clean_caption(short_caption)
+                    
+                    if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                        prompt = self.dataset_config.default_caption
             else:
                 prompt = ''
                 if self.dataset_config.default_caption is not None:
@@ -361,6 +368,13 @@ class CaptionProcessingDTOMixin:
             add_if_not_present=False,
             short_caption=False
     ):
+        if trigger is None and self.trigger_word is not None:
+            trigger = self.trigger_word
+        
+        if trigger is not None and not self.is_reg:
+            # add if not present if not regularization
+            add_if_not_present = True
+            
         if short_caption:
             raw_caption = self.raw_caption_short
         else:
@@ -368,7 +382,7 @@ class CaptionProcessingDTOMixin:
         if raw_caption is None:
             raw_caption = ''
         # handle dropout
-        if self.dataset_config.caption_dropout_rate > 0 and not short_caption:
+        if self.dataset_config.caption_dropout_rate > 0 and not short_caption and not self.dataset_config.cache_text_embeddings:
             # get a random float form 0 to 1
             rand = random.random()
             if rand < self.dataset_config.caption_dropout_rate:
@@ -383,7 +397,7 @@ class CaptionProcessingDTOMixin:
         token_list = [x for x in token_list if x]
 
         # handle token dropout
-        if self.dataset_config.token_dropout_rate > 0 and not short_caption:
+        if self.dataset_config.token_dropout_rate > 0 and not short_caption and not self.dataset_config.cache_text_embeddings:
             new_token_list = []
             keep_tokens: int = self.dataset_config.keep_tokens
             for idx, token in enumerate(token_list):
@@ -405,7 +419,7 @@ class CaptionProcessingDTOMixin:
 
         # join back together
         caption = ', '.join(token_list)
-        # caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
+        caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
 
         if self.dataset_config.random_triggers:
             num_triggers = self.dataset_config.random_triggers_max
@@ -430,7 +444,8 @@ class CaptionProcessingDTOMixin:
             token_list = [x for x in token_list if x]
             random.shuffle(token_list)
             caption = ', '.join(token_list)
-
+        if caption == '':
+            pass
         return caption
 
 
@@ -634,6 +649,9 @@ class ImageProcessingDTOMixin:
         if self.dataset_config.num_frames > 1:
             self.load_and_process_video(transform, only_load_latents)
             return
+        # handle get_prompt_embedding
+        if self.is_text_embedding_cached:
+            self.load_prompt_embedding()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -836,6 +854,9 @@ class ControlFileItemDTOMixin:
         self.has_control_image = False
         self.control_path: Union[str, List[str], None] = None
         self.control_tensor: Union[torch.Tensor, None] = None
+        self.control_tensor_list: Union[List[torch.Tensor], None] = None
+        sd = kwargs.get('sd', None)
+        self.use_raw_control_images = sd is not None and sd.use_raw_control_images
         dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
         self.full_size_control_images = False
         if dataset_config.control_path is not None:
@@ -870,28 +891,30 @@ class ControlFileItemDTOMixin:
         
         for control_path in control_path_list:
             try:
-                img = Image.open(control_path).convert('RGB')
+                img = Image.open(control_path)
                 img = exif_transpose(img)
+
+                if img.mode in ("RGBA", "LA"):
+                    # Create a background with the specified transparent color
+                    transparent_color = tuple(self.dataset_config.control_transparent_color)
+                    background = Image.new("RGB", img.size, transparent_color)
+                    # Paste the image on top using its alpha channel as mask
+                    background.paste(img, mask=img.getchannel("A"))
+                    img = background
+                else:
+                    # Already no alpha channel
+                    img = img.convert("RGB")
             except Exception as e:
                 print_acc(f"Error: {e}")
                 print_acc(f"Error loading image: {control_path}")
-
+            
             if not self.full_size_control_images:
                 # we just scale them to 512x512:
                 w, h = img.size
                 img = img.resize((512, 512), Image.BICUBIC)
 
-            else:
+            elif not self.use_raw_control_images:
                 w, h = img.size
-                if w > h and self.scale_to_width < self.scale_to_height:
-                    # throw error, they should match
-                    raise ValueError(
-                        f"unexpected values: w={w}, h={h}, file_item.scale_to_width={self.scale_to_width}, file_item.scale_to_height={self.scale_to_height}, file_item.path={self.path}")
-                elif h > w and self.scale_to_height < self.scale_to_width:
-                    # throw error, they should match
-                    raise ValueError(
-                        f"unexpected values: w={w}, h={h}, file_item.scale_to_width={self.scale_to_width}, file_item.scale_to_height={self.scale_to_height}, file_item.path={self.path}")
-
                 if self.flip_x:
                     # do a flip
                     img = img.transpose(Image.FLIP_LEFT_RIGHT)
@@ -925,11 +948,15 @@ class ControlFileItemDTOMixin:
             self.control_tensor = None
         elif len(control_tensors) == 1:
             self.control_tensor = control_tensors[0]
+        elif self.use_raw_control_images:
+            # just send the list of tensors as their shapes wont match
+            self.control_tensor_list = control_tensors
         else:
             self.control_tensor = torch.stack(control_tensors, dim=0)
 
     def cleanup_control(self: 'FileItemDTO'):
         self.control_tensor = None
+        self.control_tensor_list = None
 
 
 class ClipImageFileItemDTOMixin:
@@ -1635,6 +1662,8 @@ class LatentCachingFileItemDTOMixin:
             item["flip_x"] = True
         if self.flip_y:
             item["flip_y"] = True
+        if self.dataset_config.num_frames > 1:
+            item["num_frames"] = self.dataset_config.num_frames
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -1770,6 +1799,131 @@ class LatentCachingMixin:
 
             # restore device state
             self.sd.restore_device_state()
+
+
+class TextEmbeddingFileItemDTOMixin:
+    def __init__(self, *args, **kwargs):
+        # if we have super, call it
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        self.prompt_embeds: Union[PromptEmbeds, None] = None
+        self._text_embedding_path: Union[str, None] = None
+        self.is_text_embedding_cached = False
+        self.text_embedding_load_device = 'cpu'
+        self.text_embedding_space_version = 'sd1'
+        self.text_embedding_version = 1
+
+    def get_text_embedding_info_dict(self: 'FileItemDTO'):
+        # make sure the caption is loaded here
+        # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
+        if self.caption is None:
+            self.load_caption()
+        item = OrderedDict([
+            ("caption", self.caption),
+            ("text_embedding_space_version", self.text_embedding_space_version),
+            ("text_embedding_version", self.text_embedding_version),
+        ])
+        # if we have a control image, cache the path
+        if self.encode_control_in_text_embeddings and self.control_path is not None:
+            item["control_path"] = self.control_path
+        return item
+
+    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
+        if self._text_embedding_path is not None and not recalculate:
+            return self._text_embedding_path
+        else:
+            # we store text embeddings in a folder in same path as image called _text_embedding_cache
+            img_dir = os.path.dirname(self.path)
+            te_dir = os.path.join(img_dir, '_t_e_cache')
+            hash_dict = self.get_text_embedding_info_dict()
+            filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+            # get base64 hash of md5 checksum of hash_dict
+            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+            hash_str = hash_str.replace('=', '')
+            self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+
+        return self._text_embedding_path
+
+    def cleanup_text_embedding(self):
+        if self.prompt_embeds is not None:
+            # we are caching on disk, don't save in memory
+            self.prompt_embeds = None
+
+    def load_prompt_embedding(self, device=None):
+        if not self.is_text_embedding_cached:
+            return
+        if self.prompt_embeds is None:
+            # load it from disk
+            self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+
+class TextEmbeddingCachingMixin:
+    def __init__(self: 'AiToolkitDataset', **kwargs):
+        # if we have super, call it
+        if hasattr(super(), '__init__'):
+            super().__init__(**kwargs)
+        self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
+
+    def cache_text_embeddings(self: 'AiToolkitDataset'):
+        with accelerator.main_process_first():
+            print_acc(f"Caching text_embeddings for {self.dataset_path}")
+            print_acc(" - Saving text embeddings to disk")
+            
+            did_move = False
+
+            # use tqdm to show progress
+            i = 0
+            for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
+                file_item.text_embedding_space_version = self.sd.model_config.arch
+                file_item.latent_load_device = self.sd.device
+
+                text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
+                # only process if not saved to disk
+                if not os.path.exists(text_embedding_path):
+                    # load if not loaded
+                    if not did_move:
+                        self.sd.set_device_state_preset('cache_text_encoder')
+                        did_move = True
+                        
+                    if file_item.encode_control_in_text_embeddings:
+                        if file_item.control_path is None:
+                            raise Exception(f"Could not find a control image for {file_item.path} which is needed for this model")
+                        ctrl_img_list = []
+                        control_path_list = file_item.control_path
+                        if not isinstance(file_item.control_path, list):
+                            control_path_list = [control_path_list]
+                        for i in range(len(control_path_list)):
+                            try:
+                                img = Image.open(control_path_list[i]).convert("RGB")
+                                img = exif_transpose(img)
+                                # convert to 0 to 1 tensor
+                                img = (
+                                    TF.to_tensor(img)
+                                    .unsqueeze(0)
+                                    .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                                )
+                                ctrl_img_list.append(img)
+                            except Exception as e:
+                                print_acc(f"Error: {e}")
+                                print_acc(f"Error loading control image: {control_path_list[i]}")
+                        
+                        if len(ctrl_img_list) == 0:
+                            ctrl_img = None
+                        elif not self.sd.has_multiple_control_images:
+                            ctrl_img = ctrl_img_list[0]
+                        else:
+                            ctrl_img = ctrl_img_list
+                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                    else:
+                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
+                    # save it
+                    prompt_embeds.save(text_embedding_path)
+                    del prompt_embeds
+                file_item.is_text_embedding_cached = True
+                i += 1
+            # restore device state
+            # if did_move:
+            #     self.sd.restore_device_state()
 
 
 class CLIPCachingMixin:
@@ -1950,21 +2104,7 @@ class ControlCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
         if hasattr(super(), '__init__'):
             super().__init__(**kwargs)
-            self.control_depth_model = None
-            self.control_pose_model = None
-            self.control_line_model = None
-            self.control_bg_remover = None
-            
-    def get_control_path(self: 'AiToolkitDataset', file_item:'FileItemDTO', control_type: ControlTypes):
-        coltrols_folder = os.path.join(os.path.dirname(file_item.path), '_controls')
-        file_name_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
-        file_name_no_ext_control = f"{file_name_no_ext}.{control_type}"
-        for ext in img_ext_list:
-            possible_path = os.path.join(coltrols_folder, file_name_no_ext_control + ext)
-            if os.path.exists(possible_path):
-                return possible_path
-        # if we get here, we need to generate the control
-        return None
+            self.control_generator: ControlGenerator = None
     
     def add_control_path_to_file_item(self: 'AiToolkitDataset', file_item: 'FileItemDTO', control_path: str, control_type: ControlTypes):
         if control_type == 'inpaint':
@@ -1989,136 +2129,23 @@ class ControlCachingMixin:
             return
         with torch.no_grad():
             print_acc(f"Generating controls for {self.dataset_path}")
-            
-            has_unloaded = False
             device = self.sd.device
             
-            # controls 'depth', 'line', 'pose', 'inpaint', 'mask'
+            self.control_generator = ControlGenerator(
+                device=device,
+                sd=self.sd,
+            )
 
             # use tqdm to show progress
-            i = 0
             for file_item in tqdm(self.file_list, desc=f'Generating Controls'):
-                coltrols_folder = os.path.join(os.path.dirname(file_item.path), '_controls')
-                file_name_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
-                
-                image: Image = None
-                
                 for control_type in self.dataset_config.controls:
-                    control_path = self.get_control_path(file_item, control_type)
+                    # generates the control if it is not already there
+                    control_path = self.control_generator.get_control_path(file_item.path, control_type)
                     if control_path is not None:
                         self.add_control_path_to_file_item(file_item, control_path, control_type)
-                    else:
-                        # we need to generate the control. Unload model if not unloaded
-                        if not has_unloaded:
-                            print("Unloading model to generate controls")
-                            self.sd.set_device_state_preset('unload')
-                            has_unloaded = True
-                        
-                        if image is None:
-                            # make sure image is loaded if we havent loaded it with another control
-                            image = Image.open(file_item.path).convert('RGB')
-                            image = exif_transpose(image)
-                            
-                            # resize to a max of 1mp
-                            max_size = 1024 * 1024
-                            
-                            w, h = image.size
-                            if w * h > max_size:
-                                scale = math.sqrt(max_size / (w * h))
-                                w = int(w * scale)
-                                h = int(h * scale)
-                                image = image.resize((w, h), Image.BICUBIC)
-                        
-                        save_path = os.path.join(coltrols_folder, f"{file_name_no_ext}.{control_type}.jpg")
-                        os.makedirs(coltrols_folder, exist_ok=True)
-                        if control_type == 'depth':
-                            if self.control_depth_model is None:
-                                from transformers import pipeline
-                                self.control_depth_model = pipeline(
-                                    task="depth-estimation",
-                                    model="depth-anything/Depth-Anything-V2-Large-hf",
-                                    device=device,
-                                    torch_dtype=torch.float16
-                                )
-                            img = image.copy()
-                            in_size = img.size
-                            output = self.control_depth_model(img)
-                            out_tensor = output["predicted_depth"] # shape (1, H, W) 0 - 255
-                            out_tensor = out_tensor.clamp(0, 255)
-                            out_tensor = out_tensor.squeeze(0).cpu().numpy()
-                            img = Image.fromarray(out_tensor.astype('uint8'))
-                            img = img.resize(in_size, Image.LANCZOS)
-                            img.save(save_path)
-                            self.add_control_path_to_file_item(file_item, save_path, control_type)
-                        elif control_type == 'pose':
-                            if self.control_pose_model is None:
-                                from controlnet_aux import OpenposeDetector
-                                self.control_pose_model = OpenposeDetector.from_pretrained("lllyasviel/Annotators").to(device)
-                            img = image.copy()
-                            
-                            detect_res = int(math.sqrt(img.size[0] * img.size[1]))
-                            img = self.control_pose_model(img, hand_and_face=True, detect_resolution=detect_res, image_resolution=detect_res)
-                            img = img.convert('RGB')
-                            img.save(save_path)
-                            self.add_control_path_to_file_item(file_item, save_path, control_type)
-                            
-                        elif control_type == 'line':
-                            if self.control_line_model is None:
-                                from controlnet_aux import TEEDdetector
-                                self.control_line_model = TEEDdetector.from_pretrained("fal-ai/teed", filename="5_model.pth").to(device)
-                            img = image.copy()
-                            img = self.control_line_model(img, detect_resolution=1024)
-                            img = img.convert('RGB')
-                            img.save(save_path)
-                            self.add_control_path_to_file_item(file_item, save_path, control_type)
-                        elif control_type == 'inpaint' or control_type == 'mask':
-                            img = image.copy()
-                            if self.control_bg_remover is None:
-                                from transformers import AutoModelForImageSegmentation
-                                self.control_bg_remover = AutoModelForImageSegmentation.from_pretrained(
-                                    'ZhengPeng7/BiRefNet_HR', 
-                                    trust_remote_code=True, 
-                                    revision="595e212b3eaa6a1beaad56cee49749b1e00b1596", 
-                                    torch_dtype=torch.float16
-                                ).to(device)
-                                self.control_bg_remover.eval()
-                            
-                            image_size = (1024, 1024)
-                            transform_image = transforms.Compose([
-                                transforms.Resize(image_size),
-                                transforms.ToTensor(),
-                                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                            ])
-
-                            input_images = transform_image(img).unsqueeze(0).to('cuda').to(torch.float16)
-
-                            # Prediction
-                            preds = self.control_bg_remover(input_images)[-1].sigmoid().cpu()
-                            pred = preds[0].squeeze()
-                            pred_pil = transforms.ToPILImage()(pred)
-                            mask = pred_pil.resize(img.size)
-                            if control_type == 'inpaint':
-                                # inpainting feature currently only supports "erased" section desired to inpaint
-                                mask = ImageOps.invert(mask)
-                                img.putalpha(mask)
-                                save_path = os.path.join(coltrols_folder, f"{file_name_no_ext}.{control_type}.webp")
-                            else:
-                                img = mask
-                                img = img.convert('RGB')
-                            img.save(save_path)
-                            self.add_control_path_to_file_item(file_item, save_path, control_type)
-                        else:
-                            raise Exception(f"Error: unknown control type {control_type}")
-                i += 1
                 
             # remove models
-            self.control_depth_model = None
-            self.control_pose_model = None
-            self.control_line_model = None
-            self.control_bg_remover = None
+            self.control_generator.cleanup()
+            self.control_generator = None
             
             flush()
-
-            # restore device state
-            if has_unloaded:
-                self.sd.restore_device_state()

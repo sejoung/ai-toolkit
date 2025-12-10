@@ -46,6 +46,15 @@ ExtractMode = Union[
     'percentage'
 ]
 
+printed_messages = []
+
+
+def print_once(msg):
+    global printed_messages
+    if msg not in printed_messages:
+        print(msg)
+        printed_messages.append(msg)
+
 
 def broadcast_and_multiply(tensor, multiplier):
     # Determine the number of dimensions required
@@ -182,7 +191,7 @@ class ToolkitModuleMixin:
                 lx = self.lora_down(x)
             except RuntimeError as e:
                 print(f"Error in {self.__class__.__name__} lora_down")
-                print(e)
+                raise e
 
         if isinstance(self.dropout, nn.Dropout) or isinstance(self.dropout, nn.Identity):
             lx = self.dropout(lx)
@@ -340,7 +349,10 @@ class ToolkitModuleMixin:
         if not self.can_merge_in:
             return
         # get up/down weight
-        up_weight = self.lora_up.weight.clone().float()
+        if self.full_rank:
+            up_weight = None
+        else:
+            up_weight = self.lora_up.weight.clone().float()
         down_weight = self.lora_down.weight.clone().float()
 
         # extract weight from org_module
@@ -364,8 +376,15 @@ class ToolkitModuleMixin:
         if hasattr(self, 'scalar'):
             scale = scale * self.scalar
 
+        weight_device = weight.device
+        if weight.device != down_weight.device:
+            weight = weight.to(down_weight.device)
+        if scale.device != down_weight.device:
+            scale = scale.to(down_weight.device)
         # merge weight
-        if len(weight.size()) == 2:
+        if self.full_rank:
+            weight = weight + multiplier * down_weight * scale
+        elif len(weight.size()) == 2:
             # linear
             weight = weight + multiplier * (up_weight @ down_weight) * scale
         elif down_weight.size()[2:4] == (1, 1):
@@ -383,7 +402,7 @@ class ToolkitModuleMixin:
             weight = weight + multiplier * conved * scale
 
         # set weight to org_module
-        org_sd[weight_key] = weight.to(orig_dtype)
+        org_sd[weight_key] = weight.to(weight_device, orig_dtype)
         self.org_module[0].load_state_dict(org_sd)
 
     def setup_lorm(self: Module, state_dict: Optional[Dict[str, Any]] = None):
@@ -434,6 +453,8 @@ class ToolkitNetworkMixin:
         self.module_losses: List[torch.Tensor] = []
         self.lorm_train_mode: Literal['local', None] = None
         self.can_merge_in = not is_lorm
+        # will prevent optimizer from loading as it will have double states
+        self.did_change_weights = False
 
     def get_keymap(self: Network, force_weight_mapping=False):
         use_weight_mapping = False
@@ -565,6 +586,13 @@ class ToolkitNetworkMixin:
         if metadata is None:
             metadata = OrderedDict()
         metadata = add_model_hash_to_meta(save_dict, metadata)
+        # let the model handle the saving
+        
+        if self.base_model_ref is not None and hasattr(self.base_model_ref(), 'save_lora'):
+            # call the base model save lora method
+            self.base_model_ref().save_lora(save_dict, file, metadata)
+            return
+        
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
             save_file(save_dict, file, metadata)
@@ -577,12 +605,15 @@ class ToolkitNetworkMixin:
         keymap = {} if keymap is None else keymap
 
         if isinstance(file, str):
-            if os.path.splitext(file)[1] == ".safetensors":
-                from safetensors.torch import load_file
-
-                weights_sd = load_file(file)
+            if self.base_model_ref is not None and hasattr(self.base_model_ref(), 'load_lora'):
+                # call the base model load lora method
+                weights_sd = self.base_model_ref().load_lora(file)
             else:
-                weights_sd = torch.load(file, map_location="cpu")
+                if os.path.splitext(file)[1] == ".safetensors":
+                    from safetensors.torch import load_file
+                    weights_sd = load_file(file)
+                else:
+                    weights_sd = torch.load(file, map_location="cpu")
         else:
             # probably a state dict
             weights_sd = file
@@ -624,6 +655,46 @@ class ToolkitNetworkMixin:
             if key not in current_state_dict:
                 extra_dict[key] = load_sd[key]
                 to_delete.append(key)
+            elif "lora_down" in key or "lora_up" in key:
+                # handle expanding/shrinking LoRA (linear only)
+                if len(load_sd[key].shape) == 2:
+                    load_value = load_sd[key]                 # from checkpoint
+                    blank_val = current_state_dict[key]       # shape we need in the target model
+                    tgt_h, tgt_w = blank_val.shape
+                    src_h, src_w = load_value.shape
+
+                    if (src_h, src_w) == (tgt_h, tgt_w):
+                        # shapes already match: keep original
+                        pass
+
+                    elif "lora_down" in key and src_h < tgt_h:
+                        print_once(f"Expanding {key} from {load_value.shape} to {blank_val.shape}")
+                        new_val = torch.zeros((tgt_h, tgt_w), device=load_value.device, dtype=load_value.dtype)
+                        new_val[:src_h, :src_w] = load_value  # src_w should already match
+                        load_sd[key] = new_val
+                        self.did_change_weights = True
+
+                    elif "lora_up" in key and src_w < tgt_w:
+                        print_once(f"Expanding {key} from {load_value.shape} to {blank_val.shape}")
+                        new_val = torch.zeros((tgt_h, tgt_w), device=load_value.device, dtype=load_value.dtype)
+                        new_val[:src_h, :src_w] = load_value  # src_h should already match
+                        load_sd[key] = new_val
+                        self.did_change_weights = True
+
+                    elif "lora_down" in key and src_h > tgt_h:
+                        print_once(f"Shrinking {key} from {load_value.shape} to {blank_val.shape}")
+                        load_sd[key] = load_value[:tgt_h, :tgt_w]
+                        self.did_change_weights = True
+
+                    elif "lora_up" in key and src_w > tgt_w:
+                        print_once(f"Shrinking {key} from {load_value.shape} to {blank_val.shape}")
+                        load_sd[key] = load_value[:tgt_h, :tgt_w]
+                        self.did_change_weights = True
+
+                    else:
+                        # unexpected mismatch (e.g., both dims differ in a way that doesn't match lora_up/down semantics)
+                        raise ValueError(f"Unhandled LoRA shape change for {key}: src={load_value.shape}, tgt={blank_val.shape}")
+
         for key in to_delete:
             del load_sd[key]
 
@@ -652,12 +723,18 @@ class ToolkitNetworkMixin:
         if hasattr(first_module, 'lora_down'):
             device = first_module.lora_down.weight.device
             dtype = first_module.lora_down.weight.dtype
+            if hasattr(first_module.lora_down, '_memory_management_device'):
+                device = first_module.lora_down._memory_management_device
         elif hasattr(first_module, 'lokr_w1'):
             device = first_module.lokr_w1.device
             dtype = first_module.lokr_w1.dtype
+            if hasattr(first_module.lokr_w1, '_memory_management_device'):
+                device = first_module.lokr_w1._memory_management_device
         elif hasattr(first_module, 'lokr_w1_a'):
             device = first_module.lokr_w1_a.device
             dtype = first_module.lokr_w1_a.dtype
+            if hasattr(first_module.lokr_w1_a, '_memory_management_device'):
+                device = first_module.lokr_w1_a._memory_management_device
         else:
             raise ValueError("Unknown module type")
         with torch.no_grad():

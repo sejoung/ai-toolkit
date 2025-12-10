@@ -15,13 +15,14 @@ from toolkit.accelerator import unwrap_model
 from optimum.quanto import freeze, QTensor
 from toolkit.util.quantize import quantize, get_qtype
 from transformers import T5TokenizerFast, T5EncoderModel, CLIPTextModel, CLIPTokenizer
-from .pipeline import ChromaPipeline
+from .pipeline import ChromaPipeline, prepare_latent_image_ids
 from einops import rearrange, repeat
 import random
 import torch.nn.functional as F
 from .src.model import Chroma, chroma_params
 from safetensors.torch import load_file, save_file
 from toolkit.metadata import get_meta_for_safetensors
+import huggingface_hub
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -100,22 +101,84 @@ class ChromaModel(BaseModel):
         # will be updated if we detect a existing checkpoint in training folder
         model_path = self.model_config.name_or_path
         
-        extras_path = 'black-forest-labs/FLUX.1-schnell'
+        if model_path == "lodestones/Chroma":
+            print("Looking for latest Chroma checkpoint")
+            # get the latest checkpoint
+            files_list = huggingface_hub.list_repo_files(model_path)
+            print(files_list)
+            latest_version = 28 # current latest version at time of writing
+            while True:
+                if f"chroma-unlocked-v{latest_version}.safetensors" not in files_list:
+                    latest_version -= 1
+                    break
+                else:
+                    latest_version += 1
+            print(f"Using latest Chroma version: v{latest_version}")
+            
+            # make sure we have it
+            model_path = huggingface_hub.hf_hub_download(
+                repo_id=model_path,
+                filename=f"chroma-unlocked-v{latest_version}.safetensors",
+            )
+        elif model_path.startswith("lodestones/Chroma/v"):
+            # get the version number
+            version = model_path.split("/")[-1].split("v")[-1]
+            print(f"Using Chroma version: v{version}")
+            # make sure we have it
+            model_path = huggingface_hub.hf_hub_download(
+                repo_id='lodestones/Chroma',
+                filename=f"chroma-unlocked-v{version}.safetensors",
+            )
+        elif model_path.startswith("lodestones/Chroma1-"):
+            # will have a file in the repo that is Chroma1-whatever.safetensors
+            model_path = huggingface_hub.hf_hub_download(
+                repo_id=model_path,
+                filename=f"{model_path.split('/')[-1]}.safetensors",
+            )
+        else:
+            # check if the model path is a local file
+            if os.path.exists(model_path):
+                print(f"Using local model: {model_path}")
+            else:
+                raise ValueError(f"Model path {model_path} does not exist")
+        
+        # extras_path = 'black-forest-labs/FLUX.1-schnell'
+        # schnell model is gated now, use flex instead
+        extras_path = 'ostris/Flex.1-alpha'
 
         self.print_and_status_update("Loading transformer")
+        
+        chroma_state_dict = load_file(model_path, 'cpu')
+        
+        # determine number of double and single blocks
+        double_blocks = 0
+        single_blocks = 0
+        for key in chroma_state_dict.keys():
+            if "double_blocks" in key:
+                block_num = int(key.split(".")[1]) + 1
+                if block_num > double_blocks:
+                    double_blocks = block_num
+            elif "single_blocks" in key:
+                block_num = int(key.split(".")[1]) + 1
+                if block_num > single_blocks:
+                    single_blocks = block_num
+        print(f"Double Blocks: {double_blocks}")
+        print(f"Single Blocks: {single_blocks}")
 
+        chroma_params.depth = double_blocks
+        chroma_params.depth_single_blocks = single_blocks
         transformer = Chroma(chroma_params)
         
         # add dtype, not sure why it doesnt have it
         transformer.dtype = dtype
-        
-        chroma_state_dict = load_file(model_path, 'cpu')
         # load the state dict into the model
         transformer.load_state_dict(chroma_state_dict)
         
         transformer.to(self.quantize_device, dtype=dtype)
         
         transformer.config = FakeConfig()
+        transformer.config.num_layers = double_blocks
+        transformer.config.num_single_layers = single_blocks
 
         if self.model_config.quantize:
             # patch the state dict method
@@ -261,12 +324,19 @@ class ChromaModel(BaseModel):
                 ph=2,
                 pw=2
             )
+            
+            img_ids = prepare_latent_image_ids(
+                bs, 
+                h, 
+                w,
+                patch_size=2
+            ).to(device=self.device_torch)
 
-            img_ids = torch.zeros(h // 2, w // 2, 3)
-            img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
-            img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
-            img_ids = repeat(img_ids, "h w c -> b (h w) c",
-                             b=bs).to(self.device_torch)
+            # img_ids = torch.zeros(h // 2, w // 2, 3)
+            # img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
+            # img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
+            # img_ids = repeat(img_ids, "h w c -> b (h w) c",
+            #                  b=bs).to(self.device_torch)
 
             txt_ids = torch.zeros(
                 bs, text_embeddings.text_embeds.shape[1], 3).to(self.device_torch)
@@ -354,6 +424,8 @@ class ChromaModel(BaseModel):
         return self.text_encoder[1].encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
     
     def save_model(self, output_path, meta, save_dtype):
+        if not output_path.endswith(".safetensors"):
+            output_path =  output_path + ".safetensors"
         # only save the unet
         transformer: Chroma = unwrap_model(self.model)
         state_dict = transformer.state_dict()
